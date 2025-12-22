@@ -12,6 +12,7 @@ export type MaterialMode = 'color-key' | 'text-prompt';
 export interface MaterialMapping {
   color: string;
   material: string;
+  textureImage?: string; // Specific texture reference for this material
 }
 
 export interface RenderParams {
@@ -22,6 +23,7 @@ export interface RenderParams {
   materialMode: MaterialMode;
   angle: CameraAngle;
   inspirationImage?: string; // Style reference
+  materialTextureImage?: string; // Global Texture/Material reference
   baseSketches: string[]; // Support up to 5 perspective sources
   materialMappings: MaterialMapping[];
 }
