@@ -33,10 +33,17 @@ export class GeminiService {
 
   async generateRender(params: RenderParams, specificSketch: string): Promise<string> {
     return this.withRetry(async () => {
-      const mappingText = params.materialMappings
-        .filter(m => m.color && m.material)
-        .map(m => `- Areas colored ${m.color}: Use ${m.material}`)
-        .join('\n');
+      let materialInstruction = '';
+      
+      if (params.materialMode === 'color-key') {
+        const mappingText = params.materialMappings
+          .filter(m => m.color && m.material)
+          .map(m => `- Areas colored ${m.color}: Use ${m.material}`)
+          .join('\n');
+        materialInstruction = `COLOR-CODED MATERIAL MAP:\nThe provided sketch contains specific colors representing different building materials. Follow this mapping strictly for the architecture:\n${mappingText || "No specific color map provided."}`;
+      } else {
+        materialInstruction = `GLOBAL MATERIAL SPECIFICATIONS:\n${params.materialPrompt}`;
+      }
 
       const prompt = `Convert the provided architectural sketch into a high-end photorealistic 3D render.
       
@@ -47,9 +54,7 @@ export class GeminiService {
       LANDSCAPE & ENVIRONMENT GUIDELINES:
       ${params.landscapePrompt}
       
-      COLOR-CODED MATERIAL MAP:
-      The provided sketch contains specific colors representing different building materials. Follow this mapping strictly for the architecture:
-      ${mappingText || "No specific color map provided."}
+      ${materialInstruction}
       
       TECHNICAL QUALITY: Architectural photography style, 4K detail, realistic lighting, shadows, and high-quality textures. Ensure the landscape and building are integrated seamlessly.`;
 

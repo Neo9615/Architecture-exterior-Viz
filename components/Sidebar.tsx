@@ -65,7 +65,7 @@ const Sidebar: React.FC<SidebarProps> = ({
 
       <section>
         <label className="text-xs font-bold text-gray-500 uppercase tracking-widest mb-3 block">
-          1. Color-Coded Sketches
+          1. Perspective & Color Map
         </label>
         <div className="relative group">
           <input
@@ -79,7 +79,7 @@ const Sidebar: React.FC<SidebarProps> = ({
           <div className={`w-full h-24 bg-[#1a1a1a] border-2 border-dashed rounded-lg flex flex-col items-center justify-center transition-colors overflow-hidden ${params.baseSketches.length > 0 ? 'border-blue-500' : 'border-[#333] group-hover:border-blue-500'}`}>
             <i className="fas fa-palette text-gray-600 text-xl mb-1"></i>
             <span className="text-[10px] text-gray-500">
-              {params.baseSketches.length > 0 ? `${params.baseSketches.length} Color Maps Uploaded` : "Upload color-coded sketches"}
+              {params.baseSketches.length > 0 ? `${params.baseSketches.length} Sketches Uploaded` : "Upload color-coded perspective sketches"}
             </span>
           </div>
         </div>
@@ -91,36 +91,60 @@ const Sidebar: React.FC<SidebarProps> = ({
       </section>
 
       <section>
-        <label className="text-xs font-bold text-gray-500 uppercase tracking-widest mb-2 flex justify-between items-center">
-          2. Material Color Key
-          <button onClick={addMapping} className="text-blue-500 hover:text-blue-400 text-[10px]">
-            <i className="fas fa-plus mr-1"></i> ADD
-          </button>
-        </label>
-        <div className="flex flex-col gap-2">
-          {params.materialMappings.map((mapping, idx) => (
-            <div key={idx} className="flex gap-2 items-center">
-              <input 
-                placeholder="Color (Red)"
-                value={mapping.color}
-                onChange={(e) => updateMapping(idx, 'color', e.target.value)}
-                className="w-1/3 bg-[#1a1a1a] border border-[#222] text-[10px] rounded px-2 py-1 focus:outline-none focus:border-blue-500 text-gray-300"
-              />
-              <input 
-                placeholder="Material (Brick)"
-                value={mapping.material}
-                onChange={(e) => updateMapping(idx, 'material', e.target.value)}
-                className="flex-1 bg-[#1a1a1a] border border-[#222] text-[10px] rounded px-2 py-1 focus:outline-none focus:border-blue-500 text-gray-300"
-              />
-              <button onClick={() => removeMapping(idx)} className="text-gray-600 hover:text-red-500 transition-colors">
-                <i className="fas fa-times text-[10px]"></i>
+        <div className="flex items-center justify-between mb-3">
+          <label className="text-xs font-bold text-gray-500 uppercase tracking-widest">2. Material Selection</label>
+          <div className="flex bg-[#1a1a1a] p-0.5 rounded-md border border-[#222]">
+             <button 
+               onClick={() => setParams(p => ({ ...p, materialMode: 'color-key' }))}
+               className={`text-[9px] px-2 py-1 rounded transition-all ${params.materialMode === 'color-key' ? 'bg-blue-600 text-white shadow-md' : 'text-gray-500 hover:text-gray-300'}`}
+             >
+               COLOR KEY
+             </button>
+             <button 
+               onClick={() => setParams(p => ({ ...p, materialMode: 'text-prompt' }))}
+               className={`text-[9px] px-2 py-1 rounded transition-all ${params.materialMode === 'text-prompt' ? 'bg-blue-600 text-white shadow-md' : 'text-gray-500 hover:text-gray-300'}`}
+             >
+               PROMPT
+             </button>
+          </div>
+        </div>
+
+        {params.materialMode === 'color-key' ? (
+          <div className="flex flex-col gap-2">
+            <div className="flex justify-between items-center mb-1">
+              <span className="text-[10px] text-gray-400">Map sketch colors to materials</span>
+              <button onClick={addMapping} className="text-blue-500 hover:text-blue-400 text-[10px]">
+                <i className="fas fa-plus mr-1"></i> ADD
               </button>
             </div>
-          ))}
-          {params.materialMappings.length === 0 && (
-            <p className="text-[10px] text-gray-600 italic">No colors mapped. Using general prompts.</p>
-          )}
-        </div>
+            {params.materialMappings.map((mapping, idx) => (
+              <div key={idx} className="flex gap-2 items-center">
+                <input 
+                  placeholder="Color (e.g. Red)"
+                  value={mapping.color}
+                  onChange={(e) => updateMapping(idx, 'color', e.target.value)}
+                  className="w-1/3 bg-[#1a1a1a] border border-[#222] text-[10px] rounded px-2 py-1 focus:outline-none focus:border-blue-500 text-gray-300"
+                />
+                <input 
+                  placeholder="Material (e.g. Oak)"
+                  value={mapping.material}
+                  onChange={(e) => updateMapping(idx, 'material', e.target.value)}
+                  className="flex-1 bg-[#1a1a1a] border border-[#222] text-[10px] rounded px-2 py-1 focus:outline-none focus:border-blue-500 text-gray-300"
+                />
+                <button onClick={() => removeMapping(idx)} className="text-gray-600 hover:text-red-500 transition-colors">
+                  <i className="fas fa-times text-[10px]"></i>
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <textarea
+            value={params.materialPrompt}
+            onChange={(e) => setParams(p => ({ ...p, materialPrompt: e.target.value }))}
+            placeholder="Describe the building materials (e.g., Brushed aluminum, tinted glass, limestone base)..."
+            className="w-full h-24 bg-[#1a1a1a] border border-[#222] text-xs rounded-lg p-3 focus:outline-none focus:border-blue-500 text-gray-300 resize-none"
+          />
+        )}
       </section>
 
       <section>
@@ -148,7 +172,7 @@ const Sidebar: React.FC<SidebarProps> = ({
             {params.inspirationImage ? (
               <img src={params.inspirationImage} className="w-full h-full object-cover" alt="Inspiration" />
             ) : (
-              <span className="text-[10px] text-gray-600">Mood Reference</span>
+              <span className="text-[10px] text-gray-600 text-center px-2">Mood & Lighting Reference</span>
             )}
           </div>
         </div>
@@ -160,7 +184,7 @@ const Sidebar: React.FC<SidebarProps> = ({
           <textarea
             value={params.landscapePrompt}
             onChange={(e) => setParams(p => ({ ...p, landscapePrompt: e.target.value }))}
-            placeholder="Describe the surrounding environment, terrain, vegetation, and site context..."
+            placeholder="Describe surrounding environment, terrain, vegetation..."
             className="w-full h-16 bg-[#1a1a1a] border border-[#222] text-xs rounded-lg p-3 focus:outline-none focus:border-blue-500 text-gray-300 resize-none"
           />
         </section>

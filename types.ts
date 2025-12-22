@@ -7,6 +7,8 @@ export type RenderStyle =
 
 export type CameraAngle = 'Eye Level' | 'Bird\'s Eye' | 'Drone View' | 'Worm\'s Eye' | 'Interior Close-up' | 'Isometric';
 
+export type MaterialMode = 'color-key' | 'text-prompt';
+
 export interface MaterialMapping {
   color: string;
   material: string;
@@ -16,6 +18,8 @@ export interface RenderParams {
   style: RenderStyle;
   description: string;
   landscapePrompt: string;
+  materialPrompt: string;
+  materialMode: MaterialMode;
   angle: CameraAngle;
   inspirationImage?: string; // Style reference
   baseSketches: string[]; // Support up to 5 perspective sources

@@ -10,11 +10,14 @@ const App: React.FC = () => {
     style: 'Modernist',
     description: '',
     landscapePrompt: 'Lush mountain landscape with misty morning light and pine trees.',
+    materialPrompt: 'Exposed concrete, dark wood accents, and expansive tempered glass panels.',
+    materialMode: 'color-key',
     angle: 'Eye Level',
     baseSketches: [],
     materialMappings: [
-      { color: 'Red', material: 'Brick' },
-      { color: 'Blue', material: 'Glass' }
+      { color: 'Red', material: 'Red Clay Brick' },
+      { color: 'Blue', material: 'Reflective Glass' },
+      { color: 'Yellow', material: 'Polished Brass' }
     ],
   });
 
@@ -203,7 +206,7 @@ const App: React.FC = () => {
           <div className="flex-1 relative">
             <input 
               type="text"
-              placeholder={currentImageUrl ? "Refine landscape or add building details..." : "Upload color-coded sketches to begin."}
+              placeholder={currentImageUrl ? "Refine details or add contextual notes..." : "Upload color-coded sketches to begin."}
               disabled={!currentImageUrl || isLoading}
               className="w-full bg-[#111] border border-[#222] rounded-2xl py-3 pl-5 pr-12 focus:outline-none focus:border-blue-500/50 text-sm transition-all placeholder-gray-600 disabled:opacity-50"
               value={editPrompt}
