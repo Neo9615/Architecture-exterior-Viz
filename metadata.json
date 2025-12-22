@@ -1,0 +1,7 @@
+{
+  "name": "Archivision AI",
+  "description": "Professional architectural visualization tool for high-quality renders, material consistency across angles, and AI-powered image editing with annotations.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
