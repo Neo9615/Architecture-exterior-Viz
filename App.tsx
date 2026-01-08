@@ -1,335 +1,623 @@
 
-import React, { useState, useEffect } from 'react';
-import Sidebar from './components/Sidebar';
-import Viewport from './components/Viewport';
+import React, { useState, useEffect, useRef, Suspense, lazy } from 'react';
 import { RenderParams, Annotation, RenderResult } from './types';
-import { GeminiService } from './services/geminiService';
+import { StorageService } from './services/storageService';
+import { onAuthStateChanged, User, signOut } from 'firebase/auth';
+import { doc, getDoc, setDoc, onSnapshot, updateDoc, increment } from 'firebase/firestore';
+import { auth, db } from './firebase';
+import Auth from './components/Auth';
+import { Verification } from './components/Verification';
+import { Language, translations } from './translations';
+
+// Lazy load heavy components
+const Sidebar = lazy(() => import('./components/Sidebar'));
+const Viewport = lazy(() => import('./components/Viewport'));
+const ProfileModal = lazy(() => import('./components/ProfileModal'));
+const TopUpModal = lazy(() => import('./components/TopUpModal'));
+const ShowcaseLanding = lazy(() => import('./components/ShowcaseLanding'));
 
 const App: React.FC = () => {
+  const [user, setUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [showProfile, setShowProfile] = useState(false);
+  const [showTopUp, setShowTopUp] = useState(false);
+  
+  // Initialize based on URL safely
+  const [showLanding, setShowLanding] = useState(() => {
+    try {
+      return window.location.pathname === '/landing';
+    } catch {
+      return false;
+    }
+  });
+  
+  const [lang, setLang] = useState<Language>('en');
+
+  const t = translations[lang];
+  const isRTL = lang === 'ma';
+  const prevLangRef = useRef<Language>(lang);
+
+  const [credits, setCredits] = useState<number>(0);
+
   const [params, setParams] = useState<RenderParams>({
+    mode: 'Exterior',
+    toolMode: 'create',
     style: 'Modernist',
     description: '',
-    landscapePrompt: 'Lush mountain landscape with misty morning light and pine trees.',
-    materialPrompt: 'Exposed concrete, dark wood accents, and expansive tempered glass panels.',
-    materialMode: 'color-key',
+    landscapePrompt: translations['en'].landscapeDefault,
+    interiorAmbiance: translations['en'].interiorDefault,
+    materialPrompt: translations['en'].materialDefault,
+    materialMode: 'text-prompt',
     angle: 'Eye Level',
+    aspectRatio: 'Auto',
     baseSketches: [],
     materialMappings: [
       { color: 'Red', material: 'Red Clay Brick' },
       { color: 'Blue', material: 'Reflective Glass' },
       { color: 'Yellow', material: 'Polished Brass' }
     ],
-  });
+    furnitureLayoutMode: 'existing',
+    furniturePrompt: '',
+    modifyPrompt: '',
+    modifyMaskImage: '', // Initialize mask
+    brushSize: 0 
+  } as any);
 
   const [results, setResults] = useState<RenderResult[]>([]);
+  const [base64Cache, setBase64Cache] = useState<Record<string, string>>({});
   const [activeResultIndex, setActiveResultIndex] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
   const [isAnnotating, setIsAnnotating] = useState(false);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [editPrompt, setEditPrompt] = useState("");
-  const [hasApiKey, setHasApiKey] = useState(false);
-  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [isUpdatingNotes, setIsUpdatingNotes] = useState(false);
+  const [shouldClearMask, setShouldClearMask] = useState(0);
+  // View state to handle Modify mode uploads vs results
+  const [viewingBaseImage, setViewingBaseImage] = useState(false);
 
+  // Storage service is lightweight enough (class definition) to check cached history on mount
+  const storageService = new StorageService();
+
+  // Handle browser back/forward buttons
   useEffect(() => {
-    checkKeyStatus();
+    const handlePopState = () => {
+      try {
+        setShowLanding(window.location.pathname === '/landing');
+      } catch (e) {
+        // Ignore location errors
+      }
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
   }, []);
 
-  const checkKeyStatus = async () => {
-    const studio = (window as any).aistudio;
-    if (studio) {
-      try {
-        const has = await studio.hasSelectedApiKey();
-        setHasApiKey(has);
-      } catch (e) {
-        console.error("Error checking key status", e);
-      }
+  const handleNavigateToLanding = () => {
+    try {
+      window.history.pushState(null, '', '/landing');
+    } catch (e) {
+      console.warn("Navigation history update failed (sandboxed environment):", e);
     }
+    setShowLanding(true);
   };
 
-  const handleOpenKey = async () => {
-    const studio = (window as any).aistudio;
-    if (studio) {
-      try {
-        await studio.openSelectKey();
-        setHasApiKey(true);
-      } catch (e) {
-        console.error("Key selection failed", e);
-      }
+  const handleNavigateToApp = () => {
+    try {
+      window.history.pushState(null, '', '/');
+    } catch (e) {
+      console.warn("Navigation history update failed (sandboxed environment):", e);
     }
+    setShowLanding(false);
+  };
+
+  // Reset active index when tool mode changes
+  useEffect(() => {
+    setActiveResultIndex(0);
+    setAnnotations([]);
+    // If switching to modify and we have a base image, show it by default if no results are explicitly selected
+    if (params.toolMode === 'modify' && params.modifyBaseImage) {
+        setViewingBaseImage(true);
+    } else {
+        setViewingBaseImage(false);
+    }
+  }, [params.toolMode]);
+
+  // Sync default prompts on language change if they haven't been edited
+  useEffect(() => {
+    const prevT = translations[prevLangRef.current];
+    const currentT = translations[lang];
+
+    setParams(p => {
+      const newParams = { ...p };
+      
+      // Update landscape prompt if it matches previous default
+      if (p.landscapePrompt === prevT.landscapeDefault) {
+        newParams.landscapePrompt = currentT.landscapeDefault;
+      }
+      // Update interior ambiance if it matches previous default
+      if (p.interiorAmbiance === prevT.interiorDefault) {
+        newParams.interiorAmbiance = currentT.interiorDefault;
+      }
+      // Update material prompt if it matches previous default
+      if (p.materialPrompt === prevT.materialDefault) {
+        newParams.materialPrompt = currentT.materialDefault;
+      }
+
+      return newParams;
+    });
+
+    prevLangRef.current = lang;
+  }, [lang]);
+
+  useEffect(() => {
+    let unsubscribeHistory: () => void;
+    let unsubscribeUser: () => void;
+
+    const unsubscribeAuth = onAuthStateChanged(auth, async (currentUser) => {
+      setUser(currentUser);
+      if (currentUser) {
+        try {
+          const userRef = doc(db, 'users', currentUser.uid);
+          const userSnap = await getDoc(userRef);
+          if (!userSnap.exists()) {
+             await setDoc(userRef, {
+               uid: currentUser.uid,
+               email: currentUser.email,
+               displayName: currentUser.displayName || '',
+               photoURL: currentUser.photoURL || '',
+               photoFileName: '',
+               createdAt: new Date().toISOString(),
+               credits: 10,
+             });
+          }
+          
+          unsubscribeHistory = storageService.subscribeToHistory(currentUser.uid, (syncedResults) => {
+            setResults(syncedResults);
+            // Don't reset index here to avoid jumping around if user is browsing history
+          });
+
+          unsubscribeUser = onSnapshot(doc(db, 'users', currentUser.uid), (docSnap) => {
+            const data = docSnap.data();
+            if (data) setCredits(data.credits || 0);
+          }, (err) => {
+            console.warn("User profile listener failed (permissions):", err);
+          });
+
+        } catch (e) { 
+          console.error("Firestore initialization failed", e); 
+        }
+      }
+      setAuthLoading(false);
+    });
+
+    return () => {
+      unsubscribeAuth();
+      if (unsubscribeHistory) unsubscribeHistory();
+      if (unsubscribeUser) unsubscribeUser();
+    };
+  }, []);
+
+  const handleSignOut = async () => {
+    try {
+      await signOut(auth);
+      setResults([]);
+      setBase64Cache({});
+    } catch (error) { console.error("Error signing out", error); }
   };
 
   const handleGenerate = async () => {
-    const studio = (window as any).aistudio;
-    if (!hasApiKey && studio) {
-      await handleOpenKey();
+    if (!user) return;
+    
+    // Modify Mode Flow
+    if (params.toolMode === 'modify') {
+        if (!params.modifyBaseImage || !params.modifyPrompt) return;
+        if (credits < 1) { setShowTopUp(true); return; }
+        
+        setIsLoading(true);
+        // Dynamic Import of GeminiService
+        const { GeminiService } = await import('./services/geminiService');
+        const gemini = new GeminiService();
+        try {
+            let resultBase64 = "";
+            
+            // Check if mask exists and is valid
+            if (params.modifyMaskImage && params.modifyMaskImage.length > 100) {
+                 resultBase64 = await gemini.modifyWithMask(params.modifyBaseImage, params.modifyMaskImage, params.modifyPrompt);
+            } else {
+                 // Fallback to global edit if no mask
+                 resultBase64 = await gemini.editImage(params.modifyBaseImage, params.modifyPrompt);
+            }
+
+            const savedResult = await storageService.saveRender(user.uid, resultBase64, params.modifyBaseImage, { ...params, description: `Modified: ${params.modifyPrompt}` });
+            if (savedResult.firestoreId) {
+                setBase64Cache(prev => ({ ...prev, [savedResult.firestoreId!]: resultBase64 }));
+            }
+            await updateDoc(doc(db, 'users', user.uid), { credits: increment(-1) });
+            
+            setActiveResultIndex(0);
+            setAnnotations([]);
+            // Clear mask after successful generation
+            setShouldClearMask(prev => prev + 1);
+            setParams(p => ({ ...p, modifyMaskImage: '' }));
+            // Switch view to the result
+            setViewingBaseImage(false);
+
+        } catch (error: any) { alert("Modification failed. See console for details."); console.error(error); } 
+        finally { setIsLoading(false); }
+        return;
     }
-    
+
+    // Create Mode Flow
+    const cost = params.baseSketches.length;
+    if (credits < cost) {
+        setShowTopUp(true);
+        return;
+    }
+
     setIsLoading(true);
+    // Dynamic Import of GeminiService
+    const { GeminiService } = await import('./services/geminiService');
     const gemini = new GeminiService();
-    
     try {
-      for (let i = 0; i < params.baseSketches.length; i++) {
-        const sketch = params.baseSketches[i];
-        const resultUrl = await gemini.generateRender(params, sketch);
-        
-        const newResult: RenderResult = {
-          id: Math.random().toString(36).substr(2, 9),
-          sketchUrl: sketch,
-          renderUrl: resultUrl,
-          timestamp: Date.now()
-        };
-        
-        setResults(prev => {
-          const updated = [...prev, newResult];
-          if (prev.length === 0 && i === 0) {
-             setActiveResultIndex(0);
-          } else if (i === 0) {
-             setActiveResultIndex(prev.length);
-          }
-          return updated;
-        });
-        
-        if (params.baseSketches.length > 1 && i < params.baseSketches.length - 1) {
-          await new Promise(resolve => setTimeout(resolve, 500));
+      for (const sketch of params.baseSketches) {
+        const resultBase64 = await gemini.generateRender(params, sketch);
+        const savedResult = await storageService.saveRender(user.uid, resultBase64, sketch, params);
+        if (savedResult.firestoreId) {
+            setBase64Cache(prev => ({ ...prev, [savedResult.firestoreId!]: resultBase64 }));
         }
+        await updateDoc(doc(db, 'users', user.uid), { credits: increment(-1) });
       }
       setAnnotations([]);
-    } catch (error: any) {
-      console.error("Render failed:", error);
-      if (error.message === "API_KEY_REQUIRED" && studio) {
-        setHasApiKey(false);
-        alert("A paid API key is required for Gemini 3 Pro. Please select a valid billing-enabled project.");
-        await handleOpenKey();
-      } else {
-        alert("Generation failed. Please check your connection and try again.");
-      }
-    } finally {
-      setIsLoading(false);
-    }
+      setActiveResultIndex(0);
+    } catch (error: any) { alert("Generation failed."); } finally { setIsLoading(false); }
   };
 
-  const handleEdit = async () => {
-    const activeItem = results[activeResultIndex];
-    const activeImage = activeItem?.renderUrl;
-    if (!activeImage || (!editPrompt && annotations.length === 0)) return;
-    
+  const handleTransferToModify = () => {
+     if (!currentImageUrl) return;
+     // Set the current image as the base for modification
+     setParams(prev => ({
+         ...prev,
+         toolMode: 'modify',
+         modifyBaseImage: currentImageUrl,
+         modifyMaskImage: '', // Reset mask
+         modifyPrompt: '' // Reset prompt
+     }));
+     // Force view to show the "uploaded" base image so user can mask it
+     setViewingBaseImage(true);
+     setShouldClearMask(prev => prev + 1);
+  };
+
+  const handleUpscale = async () => {
+    if (!user) return;
+    const displayedResults = results.filter(r => (r.toolMode || 'create') === params.toolMode);
+    const activeItem = displayedResults[activeResultIndex];
+    if (!activeItem) return;
+
+    if (credits < 2) { setShowTopUp(true); return; }
+
     setIsLoading(true);
     try {
+      // Dynamic Import
+      const { GeminiService } = await import('./services/geminiService');
       const gemini = new GeminiService();
-      
-      // Build an explicit spatial mask instruction
-      let spatialContext = "";
-      if (annotations.length > 0) {
-        spatialContext = " MASKED REGIONS (ONLY EDIT INSIDE THESE BOXES): " + annotations.map((a, i) => 
-          `[REGION #${i+1}: Action="${a.label}", BoundingBox={"x_start": ${Math.round(a.x)}%, "y_start": ${Math.round(a.y)}%, "width": ${Math.round(a.width)}%, "height": ${Math.round(a.height)}%}]`
-        ).join(", ");
+      const sourceImage = (activeItem.firestoreId && base64Cache[activeItem.firestoreId]) || activeItem.renderUrl;
+      const resultBase64 = await gemini.upscaleImage(sourceImage);
+      const savedResult = await storageService.saveRender(user.uid, resultBase64, activeItem.sketchUrl, { ...params, description: `4K Upscale` });
+      if (savedResult.firestoreId) {
+        setBase64Cache(prev => ({ ...prev, [savedResult.firestoreId!]: resultBase64 }));
+        await storageService.updateNotes(user.uid, savedResult.firestoreId, "4K Upscaled Version");
       }
-      
-      const fullInstruction = (editPrompt ? `GLOBAL_GOAL: ${editPrompt}. ` : "") + spatialContext + " DO NOT MODIFY PIXELS OUTSIDE THE BOUNDING BOXES.";
-      const result = await gemini.editImage(activeImage, fullInstruction);
-      
-      const newResult: RenderResult = {
-        id: Math.random().toString(36).substr(2, 9),
-        sketchUrl: activeItem.sketchUrl,
-        renderUrl: result,
-        timestamp: Date.now()
-      };
-
-      setResults(prev => {
-        const updated = [...prev, newResult];
-        setActiveResultIndex(updated.length - 1);
-        return updated;
-      });
-      
-      setEditPrompt("");
-      setAnnotations([]); 
-      setIsAnnotating(false);
-    } catch (error: any) {
-      console.error("Edit failed:", error);
-      if (error.message === "API_KEY_REQUIRED" && (window as any).aistudio) {
-        setHasApiKey(false);
-        await handleOpenKey();
-      } else {
-        alert("Modification failed.");
-      }
-    } finally {
-      setIsLoading(false);
-    }
+      await updateDoc(doc(db, 'users', user.uid), { credits: increment(-2) });
+      setActiveResultIndex(0);
+    } catch (error: any) { alert("Upscale failed."); } finally { setIsLoading(false); }
   };
 
-  const onInspirationUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setParams(p => ({ ...p, inspirationImage: reader.result as string }));
-      };
-      reader.readAsDataURL(file);
-    }
-  };
+  const handleDownload = async () => {
+    const displayedResults = results.filter(r => (r.toolMode || 'create') === params.toolMode);
+    const activeResult = displayedResults[activeResultIndex];
 
-  const onTextureUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setParams(p => ({ ...p, materialTextureImage: reader.result as string }));
-      };
-      reader.readAsDataURL(file);
-    }
-  };
-
-  const onMappingTextureUpload = (index: number, e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        const newMappings = [...params.materialMappings];
-        newMappings[index].textureImage = reader.result as string;
-        setParams(p => ({ ...p, materialMappings: newMappings }));
-      };
-      reader.readAsDataURL(file);
-    }
-  };
-
-  const onSketchesUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || []).slice(0, 5) as File[];
-    if (files.length === 0) return;
-
-    setIsLoading(true);
+    if (!activeResult) return;
+    
     try {
-      const base64Files: string[] = [];
-      for (const file of files) {
-        const base64 = await new Promise<string>((resolve) => {
-          const reader = new FileReader();
-          reader.onloadend = () => resolve(reader.result as string);
-          reader.readAsDataURL(file);
-        });
-        base64Files.push(base64);
+      let url = activeResult.renderUrl;
+      if (user && activeResult.firestoreId) {
+         url = await storageService.downloadFile(user.uid, activeResult.firestoreId);
       }
-      setParams(p => ({ ...p, baseSketches: base64Files }));
-    } finally {
-      setIsLoading(false);
+
+      // Direct Download Logic: Fetch as Blob -> Create Object URL -> Click Link
+      const response = await fetch(url);
+      if (!response.ok) throw new Error("Network response was not ok");
+      const blob = await response.blob();
+      const blobUrl = window.URL.createObjectURL(blob);
+      
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = `ozArchViz_${activeResult.mode}_${Date.now()}.png`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(blobUrl);
+
+    } catch (error) { 
+      console.warn("Direct download failed, falling back to new tab.", error);
+      // Fallback: Open in new tab
+      let url = activeResult.renderUrl;
+      window.open(url, '_blank');
     }
   };
 
-  const activeResult = results[activeResultIndex];
-  const currentImageUrl = activeResult?.renderUrl || null;
+  const handleUpdateNotes = async (e: React.FocusEvent<HTMLTextAreaElement>) => {
+    const displayedResults = results.filter(r => (r.toolMode || 'create') === params.toolMode);
+    const activeResult = displayedResults[activeResultIndex];
+
+    if (!user || !activeResult?.firestoreId) return;
+    const newNotes = e.target.value;
+    if (newNotes === activeResult.notes) return;
+    setIsUpdatingNotes(true);
+    try {
+      await storageService.updateNotes(user.uid, activeResult.firestoreId, newNotes);
+    } finally { setIsUpdatingNotes(false); }
+  };
+
+  const handleDelete = async (index: number, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!user || !window.confirm(t.deleteConfirm)) return;
+    
+    const displayedResults = results.filter(r => (r.toolMode || 'create') === params.toolMode);
+    const item = displayedResults[index];
+
+    if (!item.firestoreId) return;
+    try {
+      await storageService.deleteFile(user.uid, item.firestoreId, item.renderUrl, item.sketchUrl);
+      if (activeResultIndex >= index && activeResultIndex > 0) {
+         setActiveResultIndex(prev => prev - 1);
+      }
+    } catch (error) { console.error("Delete failed", error); }
+  };
+
+  if (authLoading) return <div className="h-screen bg-gray-50 flex items-center justify-center"><div className="w-10 h-10 border-4 border-gray-200 border-t-gray-900 rounded-full animate-spin"></div></div>;
+
+  // ROUTING LOGIC
+  
+  // 1. Show Landing Page if toggle is active (Priority over Auth)
+  if (showLanding) {
+      return (
+        <Suspense fallback={<div className="h-screen bg-gray-50 flex items-center justify-center"><div className="w-10 h-10 border-4 border-gray-200 border-t-gray-900 rounded-full animate-spin"></div></div>}>
+            <ShowcaseLanding onBack={handleNavigateToApp} />
+        </Suspense>
+      );
+  }
+
+  // 2. Show Auth if not logged in
+  if (!user) return <Auth lang={lang} setLang={setLang} onShowShowcase={handleNavigateToLanding} />;
+  
+  // 3. Show Verification if email not verified
+  if (!user.emailVerified) return <Verification user={user} lang={lang} />;
+
+  // 4. Show Main App if logged in
+  // Filtering Logic: Only show results relevant to the current toolMode
+  const displayedResults = results.filter(r => (r.toolMode || 'create') === params.toolMode);
+  const activeResult = displayedResults[activeResultIndex];
+  
+  // Determine what image to show in Viewport
+  let currentImageUrl = null;
+  if (params.toolMode === 'modify') {
+      if (viewingBaseImage && params.modifyBaseImage) {
+          currentImageUrl = params.modifyBaseImage;
+      } else {
+          currentImageUrl = activeResult?.renderUrl || params.modifyBaseImage || null;
+      }
+  } else {
+      currentImageUrl = activeResult?.renderUrl || null;
+  }
 
   return (
-    <div className="flex flex-col md:flex-row h-screen bg-[#050505] text-gray-100 overflow-hidden">
-      {/* Mobile Header */}
-      <div className="md:hidden flex items-center justify-between px-4 py-3 bg-[#111] border-b border-[#222] z-30">
-        <div className="flex items-center gap-2">
-          <div className="w-6 h-6 bg-blue-600 rounded flex items-center justify-center">
-            <i className="fas fa-cubes text-white text-xs"></i>
-          </div>
-          <span className="font-bold text-sm tracking-tight">Archivision</span>
-        </div>
-        <button 
-          onClick={() => setIsSidebarOpen(true)}
-          className="w-10 h-10 flex items-center justify-center text-gray-400"
-        >
-          <i className="fas fa-bars"></i>
-        </button>
-      </div>
-
-      <Sidebar 
-        params={params} 
-        setParams={setParams} 
-        onGenerate={handleGenerate} 
-        isLoading={isLoading} 
-        onInspirationUpload={onInspirationUpload}
-        onTextureUpload={onTextureUpload}
-        onSketchesUpload={onSketchesUpload}
-        onMappingTextureUpload={onMappingTextureUpload}
-        hasKey={hasApiKey}
-        onOpenKey={handleOpenKey}
-        isOpen={isSidebarOpen}
-        onClose={() => setIsSidebarOpen(false)}
-      />
+    <div className={`flex flex-col md:flex-row min-h-screen md:h-screen bg-gray-50 text-gray-900 md:overflow-hidden ${isRTL ? 'font-arabic' : ''}`} dir={isRTL ? 'rtl' : 'ltr'}>
+      <Suspense fallback={null}>
+        {showProfile && <ProfileModal user={user} onClose={() => setShowProfile(false)} onSignOut={handleSignOut} lang={lang} />}
+        {showTopUp && <TopUpModal user={user} onClose={() => setShowTopUp(false)} lang={lang} />}
+      </Suspense>
       
-      <main className="flex-1 flex flex-col min-w-0">
-        <Viewport 
-          imageUrl={currentImageUrl} 
-          isLoading={isLoading} 
-          annotations={annotations}
-          onAddAnnotation={(ann) => setAnnotations(prev => [...prev, ann])}
-          onRemoveAnnotation={(i) => setAnnotations(prev => prev.filter((_, idx) => idx !== i))}
-          isAnnotating={isAnnotating}
+      <Suspense fallback={<div className="w-full md:w-80 bg-gray-50 border-r border-gray-200 flex items-center justify-center"><div className="w-8 h-8 border-4 border-gray-200 border-t-gray-900 rounded-full animate-spin"></div></div>}>
+        <Sidebar 
+            user={user} params={params} setParams={setParams} onGenerate={handleGenerate} 
+            isLoading={isLoading} 
+            onFurnitureInspirationUpload={(e) => {
+                const file = e.target.files?.[0];
+                if (file) {
+                const reader = new FileReader();
+                reader.onloadend = () => setParams(p => ({ ...p, furnitureInspirationImage: reader.result as string }));
+                reader.readAsDataURL(file);
+                }
+            }} 
+            onSitePictureUpload={(e) => {
+                const file = e.target.files?.[0];
+                if (file) {
+                const reader = new FileReader();
+                reader.onloadend = () => setParams(p => ({ ...p, sitePicture: reader.result as string }));
+                reader.readAsDataURL(file);
+                }
+            }} 
+            onTextureUpload={() => {}}
+            onSketchesUpload={(e) => {
+            const fileList = e.target.files;
+            if (!fileList) return;
+            const files = Array.from(fileList).slice(0, 5) as File[];
+            files.forEach(file => {
+                const reader = new FileReader();
+                reader.onloadend = () => setParams(p => ({ ...p, baseSketches: [...p.baseSketches, reader.result as string] }));
+                reader.readAsDataURL(file);
+            });
+            }}
+            onMappingTextureUpload={(index, e) => {
+            const file = e.target.files?.[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onloadend = () => {
+                    const newMappings = [...params.materialMappings];
+                    newMappings[index] = { ...newMappings[index], textureImage: reader.result as string };
+                    setParams(p => ({ ...p, materialMappings: newMappings }));
+                };
+                reader.readAsDataURL(file);
+            }
+            }}
+            onBaseImageUpload={(e) => {
+                const file = e.target.files?.[0];
+                if (file) {
+                const reader = new FileReader();
+                reader.onloadend = () => {
+                    setParams(p => ({ ...p, modifyBaseImage: reader.result as string }));
+                    // Reset mask when new base image is loaded
+                    setShouldClearMask(prev => prev + 1);
+                    // Switch to viewing the uploaded base image
+                    setViewingBaseImage(true);
+                };
+                reader.readAsDataURL(file);
+                }
+            }}
+            onClearMask={() => setShouldClearMask(prev => prev + 1)}
+            onSignOut={handleSignOut} onOpenProfile={() => setShowProfile(true)} 
+            onOpenTopUp={() => setShowTopUp(true)} credits={credits} lang={lang} setLang={setLang}
         />
+      </Suspense>
+      
+      <main className="flex-1 flex flex-col min-w-0 order-first md:order-none relative md:overflow-y-auto">
+        {/* Mobile Header */}
+        <div className="md:hidden flex items-center justify-between px-4 py-3 bg-white/90 backdrop-blur-lg border-b border-gray-200 sticky top-0 z-50">
+          <div className="flex items-center gap-2">
+            <img src="https://storage.googleapis.com/oavbucket/Logo_ozarch.png" alt="Logo" className="h-8 w-auto object-contain" />
+          </div>
+          <div className="flex items-center gap-3">
+             <button 
+               onClick={() => setShowTopUp(true)}
+               className="flex items-center gap-2 bg-white border border-gray-200 pl-3 pr-2 py-1.5 rounded-full shadow-sm active:bg-gray-50 transition-all"
+             >
+                <span className="text-xs font-bold text-gray-900">{credits}</span>
+                <div className="w-5 h-5 bg-gray-900 text-white rounded-full flex items-center justify-center">
+                  <i className="fas fa-plus text-[10px]"></i>
+                </div>
+             </button>
 
-        {results.length > 0 && (
-          <div className="h-16 md:h-20 bg-[#080808] border-t border-[#111] flex items-center px-4 gap-3 md:gap-4 overflow-x-auto shrink-0 no-scrollbar">
-            {results.map((res, i) => (
-              <div 
-                key={res.id}
-                onClick={() => { setActiveResultIndex(i); setAnnotations([]); }}
-                className={`relative h-10 md:h-14 aspect-video rounded-lg cursor-pointer overflow-hidden shrink-0 transition-all border-2 ${i === activeResultIndex ? 'border-blue-600 scale-105 shadow-lg shadow-blue-900/20' : 'border-transparent opacity-50 grayscale hover:opacity-100 hover:grayscale-0'}`}
-              >
-                <img src={res.renderUrl} className="w-full h-full object-cover" />
-                <div className="absolute top-0 left-0 bg-black/60 text-[8px] px-1 font-bold text-white uppercase">
-                  {i === activeResultIndex ? 'Current' : `v${i+1}`}
+             <button onClick={() => setShowProfile(true)} className="w-8 h-8 rounded-full overflow-hidden border border-gray-200">
+               {user.photoURL ? <img src={user.photoURL} className="w-full h-full object-cover" /> : <div className="w-full h-full bg-gray-100 flex items-center justify-center"><i className="fas fa-user text-xs text-gray-400"></i></div>}
+            </button>
+          </div>
+        </div>
+
+        {/* Desktop Profile Badge */}
+        <div className={`hidden md:flex absolute top-6 z-50 gap-3 ${isRTL ? 'left-6' : 'right-6'}`}>
+             <button onClick={() => setShowProfile(true)} className="flex items-center gap-2 bg-white/80 backdrop-blur-md border border-gray-200 pl-1.5 pr-4 py-1.5 rounded-full shadow-lg hover:bg-white transition-all cursor-pointer group">
+                <div className="w-7 h-7 rounded-full bg-gray-900 flex items-center justify-center text-[10px] font-bold text-white uppercase overflow-hidden">
+                  {user.photoURL ? <img src={user.photoURL} className="w-full h-full object-cover" /> : (user.displayName ? user.displayName[0] : (user.email ? user.email[0] : 'U'))}
+                </div>
+                <div className={`flex flex-col ${isRTL ? 'items-end' : 'items-start'}`}>
+                   <span className="text-xs text-gray-700 font-medium max-w-[120px] truncate leading-none">{user.displayName || t.userDefault}</span>
+                   <span className="text-[9px] text-gray-400 mt-0.5 group-hover:text-gray-900">{t.viewProfile}</span>
+                </div>
+             </button>
+        </div>
+
+        <div className="h-[45vh] md:h-full flex-none md:flex-1 min-h-[300px]">
+          <Suspense fallback={<div className="w-full h-full flex items-center justify-center bg-gray-100"><div className="w-10 h-10 border-4 border-gray-200 border-t-gray-900 rounded-full animate-spin"></div></div>}>
+            <Viewport 
+                imageUrl={currentImageUrl} 
+                isLoading={isLoading} 
+                annotations={annotations}
+                onAddAnnotation={(ann) => setAnnotations(prev => [...prev, ann])}
+                onRemoveAnnotation={(i) => setAnnotations(prev => prev.filter((_, idx) => idx !== i))}
+                isAnnotating={isAnnotating} 
+                lang={lang}
+                toolMode={params.toolMode}
+                onMaskChange={(mask) => setParams(p => ({ ...p, modifyMaskImage: mask }))}
+                shouldClearMask={shouldClearMask}
+            />
+          </Suspense>
+        </div>
+        
+        {/* Show History & Bottom Toolbar for both modes now, but filtered */}
+        {displayedResults.length > 0 && (
+              <div className="flex flex-col bg-white border-t border-gray-200 shrink-0">
+                 <div className="hidden md:flex p-4 border-b border-gray-200 gap-6">
+                    <div className="flex-1 flex flex-col gap-2">
+                       <div className={`flex items-center gap-2 ${isRTL ? 'flex-row-reverse' : ''}`}>
+                          <span className="text-[10px] font-bold text-gray-900 uppercase tracking-widest">{t.aiSummary}</span>
+                          <span className="text-[10px] text-gray-500">{new Date(activeResult?.timestamp || 0).toLocaleString()}</span>
+                       </div>
+                       <p className="text-xs text-gray-600 leading-relaxed line-clamp-2">
+                         {activeResult?.aiSummary || "No summary available."}
+                       </p>
+                    </div>
+                    <div className="flex-1 flex flex-col gap-1 relative">
+                       <label className={`text-[10px] font-bold text-gray-500 uppercase tracking-widest flex items-center justify-between ${isRTL ? 'flex-row-reverse' : ''}`}>
+                          {t.projectNotes}
+                          {isUpdatingNotes && <span className="text-gray-500 animate-pulse">{t.saving}</span>}
+                       </label>
+                       <textarea
+                         defaultValue={activeResult?.notes}
+                         key={activeResult?.firestoreId} 
+                         onBlur={handleUpdateNotes}
+                         placeholder={t.notesPlaceholder}
+                         className="w-full h-12 bg-gray-50 border border-gray-200 rounded-lg p-2 text-xs text-gray-900 focus:outline-none focus:border-gray-900 resize-none"
+                       />
+                    </div>
+                 </div>
+
+                 <div className="h-16 md:h-24 flex items-center px-4 gap-3 md:gap-4 overflow-x-auto no-scrollbar" dir="ltr">
+                  {displayedResults.map((res, i) => (
+                    <div 
+                      key={res.firestoreId || res.id}
+                      onClick={() => { setActiveResultIndex(i); setAnnotations([]); setViewingBaseImage(false); }}
+                      className={`relative group h-12 md:h-16 aspect-video rounded-lg cursor-pointer overflow-hidden shrink-0 transition-all border-2 ${i === activeResultIndex && !viewingBaseImage ? 'border-gray-900 scale-105' : 'border-transparent opacity-70 hover:opacity-100'}`}
+                    >
+                      <img src={res.renderUrl} className="w-full h-full object-cover" />
+                      <div className="absolute top-0 left-0 bg-black/60 text-[8px] px-1 font-bold text-white uppercase">v{displayedResults.length - i}</div>
+                      <button onClick={(e) => handleDelete(i, e)} className="absolute top-0 right-0 p-1 bg-red-900/80 text-white opacity-0 group-hover/sketch:opacity-100 flex items-center justify-center text-white transition-opacity"><i className="fas fa-trash text-[8px]"></i></button>
+                    </div>
+                  ))}
                 </div>
               </div>
-            ))}
-          </div>
         )}
 
-        <div className="h-auto md:h-24 bg-[#0a0a0a] border-t border-[#222] px-4 md:px-8 py-3 md:py-0 flex flex-col md:flex-row items-stretch md:items-center gap-3 md:gap-6 shrink-0">
-          <div className="flex gap-2 justify-center md:justify-start">
-            <button 
-              onClick={() => setIsAnnotating(!isAnnotating)}
-              className={`w-10 h-10 md:w-12 md:h-12 rounded-xl flex items-center justify-center transition-all ${
-                isAnnotating ? 'bg-blue-600 text-white shadow-lg shadow-blue-900/40 animate-pulse' : 'bg-[#111] text-gray-400 hover:text-white border border-[#222]'
-              }`}
-              title="Add Material Notes"
-            >
-              <i className="fas fa-tag"></i>
-            </button>
-            <button 
-              disabled={isLoading || !currentImageUrl}
-              onClick={() => {
-                const link = document.createElement('a');
-                link.href = currentImageUrl!;
-                link.download = `archivision-render-${activeResultIndex + 1}.png`;
-                link.click();
-              }}
-              className="w-10 h-10 md:w-12 md:h-12 rounded-xl bg-[#111] text-gray-400 hover:text-white border border-[#222] disabled:opacity-20 flex items-center justify-center"
-              title="Download Render"
-            >
-              <i className="fas fa-download"></i>
-            </button>
-          </div>
+            {/* Desktop Toolbar - Simplified */}
+            <div className={`hidden md:flex h-20 bg-white border-t border-gray-200 px-8 items-center justify-between shrink-0 ${isRTL ? 'flex-row-reverse' : ''}`}>
+              <div className="flex gap-2">
+                <button 
+                   onClick={handleUpscale}
+                   disabled={!currentImageUrl || isLoading}
+                   className="h-12 px-4 rounded-xl bg-white text-gray-900 hover:bg-gray-50 border border-gray-200 disabled:opacity-50 flex items-center justify-center gap-2 font-bold text-xs"
+                   title={t.upscaleTooltip}
+                ><span className="bg-gray-900 text-white px-1.5 py-0.5 rounded text-[10px]">4K</span>{t.upscale}</button>
+                <button 
+                  disabled={isLoading || !currentImageUrl}
+                  onClick={handleDownload}
+                  className="w-12 h-12 rounded-xl bg-white text-gray-500 hover:text-gray-900 border border-gray-200 disabled:opacity-50 flex items-center justify-center"
+                  title={t.downloadTooltip}
+                ><i className="fas fa-download"></i></button>
+              </div>
 
-          <div className="flex-1 relative">
-            <input 
-              type="text"
-              placeholder={currentImageUrl ? (isAnnotating ? "Describe change for the selected area..." : "General refinement or tap the tag icon to select areas...") : "Upload sketches to begin."}
-              disabled={!currentImageUrl || isLoading}
-              className="w-full bg-[#111] border border-[#222] rounded-xl md:rounded-2xl py-2 md:py-3 pl-4 md:pl-5 pr-12 focus:outline-none focus:border-blue-500/50 text-xs md:text-sm transition-all placeholder-gray-600 disabled:opacity-50"
-              value={editPrompt}
-              onChange={(e) => setEditPrompt(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && handleEdit()}
-            />
-            <button 
-              onClick={handleEdit}
-              disabled={!currentImageUrl || (!editPrompt && annotations.length === 0) || isLoading}
-              className="absolute right-2 top-1/2 -translate-y-1/2 w-8 h-8 rounded-lg bg-blue-600 text-white flex items-center justify-center hover:bg-blue-500 transition-all disabled:opacity-20 shadow-lg shadow-blue-900/20"
-            >
-              <i className="fas fa-magic text-xs"></i>
-            </button>
-          </div>
+              <div className="flex items-center gap-2">
+                 <button 
+                    onClick={handleTransferToModify}
+                    disabled={!currentImageUrl || isLoading}
+                    className="h-12 px-6 rounded-xl bg-gray-900 text-white hover:bg-black disabled:opacity-50 flex items-center justify-center gap-2 font-bold text-xs shadow-lg transition-all"
+                    title={t.transferToModify}
+                 >
+                    <i className="fas fa-vector-square"></i> {t.transferToModify}
+                 </button>
+              </div>
+            </div>
 
-          <div className="hidden md:flex items-center gap-2">
-             <div className="text-right">
-                <div className="text-[10px] text-gray-500 font-bold uppercase tracking-widest leading-none">History</div>
-                <div className="text-xs text-blue-400 font-medium">
-                  {results.length} Attempts
-                </div>
-             </div>
-          </div>
-        </div>
+            {/* Mobile Toolbar - Simplified */}
+            <div className="md:hidden sticky bottom-0 z-40 bg-white/95 backdrop-blur-xl border-t border-gray-200 p-4 flex gap-2">
+                <button 
+                    onClick={handleTransferToModify} 
+                    disabled={!currentImageUrl} 
+                    className="flex-1 py-3 rounded-xl bg-gray-900 text-white hover:bg-black disabled:opacity-50 flex items-center justify-center gap-2 font-bold text-xs shadow-lg"
+                >
+                    <i className="fas fa-vector-square"></i> {t.transferToModify}
+                </button>
+                <button onClick={handleUpscale} disabled={!currentImageUrl || isLoading} className="w-12 h-12 rounded-xl bg-white border border-gray-200 text-gray-900 flex items-center justify-center font-bold text-[10px]"><span className="bg-gray-900 text-white px-1 rounded">4K</span></button>
+                <button disabled={!currentImageUrl} onClick={handleDownload} className="w-12 h-12 bg-white border border-gray-200 rounded-xl text-gray-500 flex items-center justify-center"><i className="fas fa-download text-xs"></i></button>
+            </div>
       </main>
     </div>
   );

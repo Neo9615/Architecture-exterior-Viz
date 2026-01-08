@@ -18,7 +18,12 @@ export const STYLES: RenderStyle[] = [
   'Zen',
   'Colonial',
   'Mid-Century Modern',
-  'Deconstructivism'
+  'Deconstructivism',
+  'Japandi',
+  'Industrial Loft',
+  'Bohemian',
+  'Hollywood Regency',
+  'Contemporary Classic'
 ];
 
 export const ANGLES: CameraAngle[] = [
@@ -27,5 +32,6 @@ export const ANGLES: CameraAngle[] = [
   'Drone View',
   'Worm\'s Eye',
   'Interior Close-up',
-  'Isometric'
+  'Isometric',
+  'Wide Angle Interior'
 ];
