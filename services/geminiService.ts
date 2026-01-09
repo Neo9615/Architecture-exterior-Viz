@@ -299,7 +299,7 @@ export class GeminiService {
         parts.push({ text: `SURFACE FINISH REFERENCE: Apply the physical properties of this sample to relevant elements.` });
       }
 
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const ai = new GoogleGenAI({ apiKey: "AIzaSyBQGJDAFp7dXxgpv7Ww_OV53Ck_lU9M4VQ" });
       
       // Determine final aspect ratio
       // Ensure strict typing for Gemini API which does not support 'Auto'
@@ -351,7 +351,7 @@ export class GeminiService {
           console.warn("Could not detect edit aspect ratio");
       }
 
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const ai = new GoogleGenAI({ apiKey: "AIzaSyBQGJDAFp7dXxgpv7Ww_OV53Ck_lU9M4VQ" });
       const response = await ai.models.generateContent({
         model: 'gemini-2.5-flash-image',
         contents: {
@@ -407,7 +407,7 @@ export class GeminiService {
           console.warn("Could not detect modify aspect ratio");
       }
 
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const ai = new GoogleGenAI({ apiKey: "AIzaSyBQGJDAFp7dXxgpv7Ww_OV53Ck_lU9M4VQ" });
       
       const response = await ai.models.generateContent({
         model: 'gemini-2.5-flash-image',
