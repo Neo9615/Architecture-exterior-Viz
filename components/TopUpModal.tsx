@@ -18,7 +18,7 @@ const PLANS = [
   { credits: 1000, price: '899 dhs', id: 'enterprise' },
 ];
 
-export const TopUpModal: React.FC<TopUpModalProps> = ({ user, onClose, lang }) => {
+const TopUpModal: React.FC<TopUpModalProps> = ({ user, onClose, lang }) => {
   const t = translations[lang];
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
@@ -178,3 +178,5 @@ export const TopUpModal: React.FC<TopUpModalProps> = ({ user, onClose, lang }) =
     </div>
   );
 };
+
+export default TopUpModal;

@@ -1,5 +1,5 @@
 
-import React from 'react';
+import React, { useState } from 'react';
 import { User } from 'firebase/auth';
 import { STYLES } from '../constants';
 import { RenderStyle, RenderParams, MaterialMapping, AspectRatio } from '../types';
@@ -152,13 +152,13 @@ const Sidebar: React.FC<SidebarProps> = ({
         <>
           <section className="flex bg-gray-100 p-1 rounded-xl border border-gray-200">
              <button 
-               onClick={() => setParams(p => ({ ...p, mode: 'Exterior' }))}
+               onClick={() => setParams(p => ({ ...p, mode: 'Exterior', materialMode: 'text-prompt' }))}
                className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-lg text-[10px] font-bold transition-all ${params.mode === 'Exterior' ? 'bg-gray-900 text-white shadow-lg' : 'text-gray-500 hover:text-gray-900'}`}
              >
                <i className="fas fa-city"></i> {t.ext}
              </button>
              <button 
-               onClick={() => setParams(p => ({ ...p, mode: 'Interior' }))}
+               onClick={() => setParams(p => ({ ...p, mode: 'Interior', materialMode: 'text-prompt' }))}
                className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-lg text-[10px] font-bold transition-all ${params.mode === 'Interior' ? 'bg-gray-900 text-white shadow-lg' : 'text-gray-500 hover:text-gray-900'}`}
              >
                <i className="fas fa-couch"></i> {t.int}
@@ -237,6 +237,7 @@ const Sidebar: React.FC<SidebarProps> = ({
             <section>
               <div className="flex items-center justify-between mb-3">
                 <label className="text-xs font-bold text-gray-500 uppercase tracking-widest">{t.step2}</label>
+                
                 {params.mode === 'Exterior' ? (
                   <div className="flex bg-gray-100 p-0.5 rounded-lg border border-gray-200">
                     <button 
@@ -253,11 +254,26 @@ const Sidebar: React.FC<SidebarProps> = ({
                     </button>
                   </div>
                 ) : (
-                   <span className="text-[9px] px-2 py-1 rounded bg-gray-900 text-white shadow-md font-bold">{t.text}</span>
+                  <div className="flex bg-gray-100 p-0.5 rounded-lg border border-gray-200">
+                    <button 
+                      onClick={() => setParams(p => ({ ...p, materialMode: 'text-prompt' }))}
+                      className={`px-2 py-0.5 text-[9px] font-bold rounded transition-all ${params.materialMode === 'text-prompt' ? 'bg-white shadow-sm text-gray-900' : 'text-gray-400'}`}
+                    >
+                      {t.text}
+                    </button>
+                    <button 
+                      onClick={() => setParams(p => ({ ...p, materialMode: 'reference-image' }))}
+                      className={`px-2 py-0.5 text-[9px] font-bold rounded transition-all ${params.materialMode === 'reference-image' ? 'bg-white shadow-sm text-gray-900' : 'text-gray-400'}`}
+                    >
+                      {t.reference}
+                    </button>
+                  </div>
                 )}
               </div>
               
-              {params.materialMode === 'color-map' && params.mode === 'Exterior' ? (
+              {/* Content for Step 2 */}
+              {params.mode === 'Exterior' && params.materialMode === 'color-map' ? (
+                /* EXTERIOR MAP MODE */
                 <div className="flex flex-col gap-2">
                    <p className="text-[9px] text-gray-400 mb-1">{t.mapColors}</p>
                    {params.materialMappings.map((mapping, idx) => (
@@ -294,8 +310,56 @@ const Sidebar: React.FC<SidebarProps> = ({
                       <i className="fas fa-plus"></i> {t.add}
                    </button>
                 </div>
+              ) : params.mode === 'Interior' && params.materialMode === 'reference-image' ? (
+                 /* INTERIOR REFERENCE MODE */
+                 <div className="flex flex-col gap-3">
+                   <div className="relative group">
+                     <div className="relative overflow-hidden w-full">
+                        <input 
+                            type="file" 
+                            accept="image/*" 
+                            onChange={(e) => {
+                                const file = e.target.files?.[0];
+                                if (file) {
+                                    const reader = new FileReader();
+                                    reader.onloadend = () => setParams(p => ({ ...p, materialTextureImage: reader.result as string }));
+                                    reader.readAsDataURL(file);
+                                }
+                            }}
+                            className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" 
+                        />
+                        <div className={`w-full h-24 bg-gray-50 border-2 border-dashed rounded-lg flex flex-col items-center justify-center transition-all relative overflow-hidden ${params.materialTextureImage ? 'border-gray-900 bg-gray-100' : 'border-gray-300'}`}>
+                           {params.materialTextureImage ? (
+                               <div className="w-full h-full relative">
+                                  <img src={params.materialTextureImage} className="w-full h-full object-cover" />
+                                  <div className="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                                      <span className="text-[10px] text-white font-bold uppercase tracking-tight">{t.referenceLoaded}</span>
+                                  </div>
+                               </div>
+                           ) : (
+                               <div className="flex flex-col items-center">
+                                  <i className="fas fa-image text-gray-400 text-lg mb-1"></i>
+                                  <span className="text-[10px] text-gray-500 text-center px-4 leading-tight">{t.uploadReference}</span>
+                               </div>
+                           )}
+                        </div>
+                     </div>
+                   </div>
+                   {/* Optional additional text prompt even in reference mode */}
+                   <textarea 
+                        value={params.materialPrompt} 
+                        onChange={(e) => setParams(p => ({ ...p, materialPrompt: e.target.value }))} 
+                        className="w-full h-16 bg-gray-50 border border-gray-200 text-xs rounded-lg p-3 resize-none focus:border-gray-900 focus:outline-none" 
+                        placeholder={t.notesPlaceholder}
+                   />
+                 </div>
               ) : (
-                <textarea value={params.materialPrompt} onChange={(e) => setParams(p => ({ ...p, materialPrompt: e.target.value }))} className="w-full h-24 bg-gray-50 border border-gray-200 text-xs rounded-lg p-3 resize-none focus:border-gray-900 focus:outline-none" />
+                /* TEXT PROMPT MODE (DEFAULT FOR EXT & INT) */
+                <textarea 
+                    value={params.materialPrompt} 
+                    onChange={(e) => setParams(p => ({ ...p, materialPrompt: e.target.value }))} 
+                    className="w-full h-24 bg-gray-50 border border-gray-200 text-xs rounded-lg p-3 resize-none focus:border-gray-900 focus:outline-none" 
+                />
               )}
             </section>
 

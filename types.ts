@@ -8,7 +8,7 @@ export type RenderStyle =
 
 export type CameraAngle = 'Eye Level' | 'Bird\'s Eye' | 'Drone View' | 'Worm\'s Eye' | 'Interior Close-up' | 'Isometric' | 'Wide Angle Interior';
 
-export type MaterialMode = 'text-prompt' | 'color-map';
+export type MaterialMode = 'text-prompt' | 'color-map' | 'reference-image';
 
 export type EnvironmentMode = 'Exterior' | 'Interior';
 
@@ -22,6 +22,12 @@ export interface MaterialMapping {
   color: string;
   material: string;
   textureImage?: string; 
+}
+
+export interface Project {
+  id: string;
+  name: string;
+  timestamp: number;
 }
 
 export interface RenderParams {
@@ -46,6 +52,8 @@ export interface RenderParams {
   modifyBaseImage?: string;
   modifyMaskImage?: string; // Base64 of the generated mask
   modifyPrompt: string;
+  // Project grouping
+  projectId?: string;
 }
 
 export interface Annotation {
@@ -67,4 +75,5 @@ export interface RenderResult {
   notes?: string;
   aiSummary?: string;
   size?: number; // Size in bytes
+  projectId?: string;
 }

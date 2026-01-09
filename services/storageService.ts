@@ -2,7 +2,7 @@
 import { ref, uploadBytes, getDownloadURL, deleteObject } from "firebase/storage";
 import { collection, addDoc, query, orderBy, onSnapshot, deleteDoc, doc, updateDoc, getDoc } from "firebase/firestore";
 import { db, storage } from "../firebase";
-import { RenderResult, RenderParams } from "../types";
+import { RenderResult, RenderParams, Project } from "../types";
 
 export class StorageService {
   
@@ -86,6 +86,7 @@ export class StorageService {
         notes: '',
         aiSummary: `Generated ${params.style} ${params.mode} render.`, 
         size: totalSize,
+        projectId: params.projectId || null, // Save project ID
         createdAt: new Date().toISOString()
       };
 
@@ -103,7 +104,8 @@ export class StorageService {
         toolMode: params.toolMode,
         notes: fileData.notes,
         aiSummary: fileData.aiSummary,
-        size: totalSize
+        size: totalSize,
+        projectId: params.projectId
       };
     } catch (error: any) {
       // Sanitize error to prevent "Converting circular structure to JSON"
@@ -134,7 +136,8 @@ export class StorageService {
           toolMode: data.toolMode || 'create', // Default to create for old records
           notes: data.notes || '',
           aiSummary: data.aiSummary || '',
-          size: data.size || 0
+          size: data.size || 0,
+          projectId: data.projectId || null
         };
       });
       onUpdate(results);
@@ -143,6 +146,52 @@ export class StorageService {
       const msg = error?.message || "Unknown error";
       console.warn(`Firestore history listener for ${uid} failed:`, msg);
     });
+  }
+
+  // --- Project Management Methods ---
+
+  async createProject(uid: string, name: string): Promise<Project> {
+    try {
+      const projectsCollection = collection(db, "users", uid, "projects");
+      const timestamp = Date.now();
+      const docRef = await addDoc(projectsCollection, {
+        name,
+        timestamp,
+        createdAt: new Date().toISOString()
+      });
+      
+      return {
+        id: docRef.id,
+        name,
+        timestamp
+      };
+    } catch (error: any) {
+      console.error("Error creating project:", error);
+      throw error;
+    }
+  }
+
+  subscribeToProjects(uid: string, onUpdate: (projects: Project[]) => void) {
+    if (!uid) return () => {};
+    
+    const projectsCollection = collection(db, "users", uid, "projects");
+    const q = query(projectsCollection, orderBy("timestamp", "desc"));
+    
+    return onSnapshot(q, (snapshot) => {
+      const projects: Project[] = snapshot.docs.map(doc => ({
+        id: doc.id,
+        name: doc.data().name,
+        timestamp: doc.data().timestamp
+      }));
+      onUpdate(projects);
+    }, (error) => {
+      console.warn("Firestore projects listener failed:", error);
+    });
+  }
+
+  async moveFileToProject(uid: string, fileId: string, projectId: string | null) {
+    const docRef = doc(db, "users", uid, "files", fileId);
+    await updateDoc(docRef, { projectId });
   }
 
   async updateNotes(uid: string, fileId: string, notes: string) {
