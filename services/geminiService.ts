@@ -1,6 +1,6 @@
 
 import { GoogleGenAI } from "@google/genai";
-import { RenderParams, AspectRatio } from "../types";
+import { RenderParams } from "../types";
 
 export class GeminiService {
   private async withRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
@@ -9,20 +9,46 @@ export class GeminiService {
       try {
         return await fn();
       } catch (error: any) {
-        // Aggressively sanitize error to prevent circular structure issues
-        const errorMessage = error?.message ? String(error.message) : String(error);
+        // 1. Robust Error Message Extraction
+        let errorMessage = "Unknown Error";
         
+        if (typeof error === 'string') {
+            errorMessage = error;
+        } else if (error instanceof Error) {
+            errorMessage = error.message;
+        } else if (error && typeof error === 'object') {
+            // Handle API JSON error responses like {"error": {"message": "..."}}
+            if (error.error && error.error.message) {
+                errorMessage = error.error.message;
+            } else if (error.message) {
+                errorMessage = String(error.message);
+            } else {
+                try {
+                    // Be careful with stringify here too
+                    errorMessage = JSON.stringify(error);
+                } catch (e) {
+                    errorMessage = "Circular/Complex Error Object";
+                }
+            }
+        }
+
+        // 2. Create clean Error object (prevents circular reference issues in calling code)
         lastError = new Error(errorMessage);
-        if (error?.stack && typeof error.stack === 'string') {
+        if (error instanceof Error && error.stack) {
             lastError.stack = error.stack;
         }
 
         const lowerMessage = errorMessage.toLowerCase();
-        
-        if (lowerMessage.includes('requested entity was not found')) {
+
+        // 3. Check for specific Critical Errors (No Retry)
+        if (lowerMessage.includes('requested entity was not found') || lowerMessage.includes('api_key_required')) {
           throw new Error("API_KEY_REQUIRED");
         }
+        if (lowerMessage.includes('leaked') || lowerMessage.includes('permission_denied')) {
+          throw new Error("API_KEY_LEAKED");
+        }
 
+        // 4. Check for Transient Errors (Retry)
         const isTransient = 
           lowerMessage.includes('500') || 
           lowerMessage.includes('internal error') ||
@@ -37,10 +63,11 @@ export class GeminiService {
         
         if (isTransient && i < maxRetries - 1) {
           const delay = Math.pow(2, i + 1) * 1000 + Math.random() * 1000;
-          console.warn(`API Busy or Network Error (${lowerMessage}). Retrying in ${Math.round(delay)}ms...`);
+          console.warn(`API Busy or Network Error (${errorMessage}). Retrying in ${Math.round(delay)}ms...`);
           await new Promise(resolve => setTimeout(resolve, delay));
           continue;
         }
+        
         throw lastError;
       }
     }
@@ -62,7 +89,7 @@ export class GeminiService {
         if (!response.ok) throw new Error(`Fetch status: ${response.status}`);
         const blob = await response.blob();
         
-        // Use detected mime type if valid, otherwise fallback to PNG conversion
+        // Use detected mime type if valid
         const mimeType = blob.type;
         const validTypes = ['image/png', 'image/jpeg', 'image/webp', 'image/heic', 'image/heif'];
         
@@ -99,8 +126,9 @@ export class GeminiService {
                     mimeType: 'image/png' 
                 });
             };
-            img.onerror = () => reject(new Error("Image load failed"));
-            // Add cache buster to prevent cached CORS errors
+            // CRITICAL FIX: Do not pass the event object 'e' to reject, as it contains circular refs
+            img.onerror = () => reject(new Error("Image load failed during fallback conversion"));
+            
             try {
                 const urlObj = new URL(str);
                 urlObj.searchParams.set('cb', Date.now().toString());
@@ -123,33 +151,10 @@ export class GeminiService {
     return { data: str, mimeType: 'image/png' };
   }
 
-  // Helper to determine the closest aspect ratio for the model configuration
-  private getClosestAspectRatio(width: number, height: number): string {
-    const target = width / height;
-    const supported = [
-      { id: "1:1", val: 1.0 },
-      { id: "4:3", val: 1.333 },
-      { id: "3:4", val: 0.75 },
-      { id: "16:9", val: 1.777 },
-      { id: "9:16", val: 0.5625 }
-    ];
-    // Find closest
-    return supported.reduce((prev, curr) => 
-      Math.abs(curr.val - target) < Math.abs(prev.val - target) ? curr : prev
-    ).id;
-  }
-
-  private async getImageDimensions(data: string, mimeType: string): Promise<{width: number, height: number}> {
-      return new Promise((resolve, reject) => {
-          const img = new Image();
-          img.onload = () => resolve({ width: img.width, height: img.height });
-          img.onerror = reject;
-          img.src = `data:${mimeType};base64,${data}`;
-      });
-  }
-
   async generateRender(params: RenderParams, specificSketch: string): Promise<string> {
     return this.withRetry(async () => {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      
       const sketchImg = await this.processImageInput(specificSketch);
       const parts: any[] = [
         {
@@ -215,299 +220,151 @@ export class GeminiService {
           }
         });
 
-        // Split logic based on 'furnitureLayoutMode'
         if (params.furnitureLayoutMode === 'empty') {
-            // Case A: Without Furniture (Empty Shell) -> Virtual Staging
             contextPrompt += `\n
             TASK: VIRTUAL STAGING OF AN EMPTY SPACE.
-            1. GEOMETRY PRESERVATION (NON-NEGOTIABLE): The input sketch (Image #0) is the rigid architectural shell. DO NOT MODIFY WALLS, WINDOWS, DOORS, or CEILING HEIGHTS.
-            2. FURNISHING: The room is currently empty or contains only rough outlines. FURNISH the space based on the following description: "${params.furniturePrompt}".
-            3. STYLE MATCHING: Use Image #${furniturePartIndex} as the STRICT stylistic reference for the furniture design, materials, and color palette.
-            4. PLACEMENT: Arrange the new furniture realistically within the preserved architectural shell. Do not block doors or windows shown in the sketch.
+            1. GEOMETRY PRESERVATION: The input sketch (Image #0) is the architectural shell. DO NOT MODIFY WALLS, WINDOWS, or CEILINGS.
+            2. FURNISHING: Furnish the space based on: "${params.furniturePrompt}".
+            3. STYLE MATCHING: Use Image #${furniturePartIndex} as the stylistic reference.
             `;
         } else {
-            // Case B: With Furniture -> Replacement
             contextPrompt += `\n
             TASK: FURNITURE REPLACEMENT.
-            1. SPATIAL INTEGRITY: The input sketch (Image #0) defines the exact room boundaries (walls, windows, doors). These must remain UNTOUCHED.
-            2. LAYOUT MATCHING: PRESERVE the exact position, rotation, and scale of the sketched furniture.
-            3. STYLE MATCHING: The new furniture MUST match the design style, material, and luxury level of the inspiration image (Image #${furniturePartIndex}).
+            1. SPATIAL INTEGRITY: Preserve room boundaries from Image #0.
+            2. STYLE MATCHING: The new furniture MUST match the style of Image #${furniturePartIndex}.
             `;
         }
       } else if (isInterior) {
-        // Fallback if no inspiration image is provided
-        contextPrompt += `\n
-        TASK: INTERIOR REALIZATION.
-        1. STRUCTURAL INTEGRITY (ABSOLUTE PRIORITY): The input sketch (Image #0) is the GROUND TRUTH for the room's geometry.
-        2. DO NOT ADD OR REMOVE: Windows, doors, columns, beams, or walls. If it is drawn, it exists. If it is not drawn, it does not exist.
-        3. EXACT MATCH: The placement of every architectural element must align perfectly with the sketch lines.`;
+        contextPrompt += `\nTASK: INTERIOR REALIZATION. The input sketch is the ground truth. Preserve all geometry.`;
       }
 
       if (!isInterior && params.sitePicture) {
-        const siteImg = await this.processImageInput(params.sitePicture);
-        const sitePartIndex = parts.length;
-        parts.push({
-          inlineData: {
-            mimeType: siteImg.mimeType,
-            data: siteImg.data
-          }
-        });
-        contextPrompt = `
-        SITE COMPOSITION INSTRUCTION (CRITICAL):
-        1. IMAGE #${sitePartIndex} IS THE REAL-WORLD SITE PHOTO.
-        2. TASK: COMPOSITE/INSERT the building from the sketch (Image #0) directly into the environment of Image #${sitePartIndex}.
-        3. MATCH PERSPECTIVE: Align the building's geometry to match the ground plane and camera angle of the SITE PHOTO.
-        4. MATCH LIGHTING: Analyze the sun direction, shadow hardness, and color temperature of the SITE PHOTO. Apply EXACTLY the same lighting conditions to the new building.
-        5. BLENDING: Ensure the building foundation interacts naturally with the terrain in the SITE PHOTO.
-        6. IGNORE any generic landscape descriptions; the SITE PHOTO is the absolute truth for the environment.`;
+          const siteImg = await this.processImageInput(params.sitePicture);
+          const sitePartIndex = parts.length;
+          parts.push({
+            inlineData: { mimeType: siteImg.mimeType, data: siteImg.data }
+          });
+          contextPrompt += `\nSITE CONTEXT: Use Image #${sitePartIndex} as the strict background and environmental context. The building must be composited realistically into this specific site.`;
       }
 
-      const prompt = `ACT AS A WORLD-CLASS ARCHITECTURAL VISUALIZER SPECIALIZING IN PHOTOREALISM.
-      
-      TASK: Photorealistically render the provided ${isInterior ? 'interior space' : 'architectural structure'} layout.
-      
-      CRITICAL STRUCTURAL RULES (ZERO TOLERANCE FOR HALLUCINATION):
-      - The input sketch (Image #0) IS THE GEOMETRY. You are a renderer, not an architect. You cannot redesign the space.
-      - WALLS/WINDOWS/DOORS: Must match Image #0 exactly in position, size, and shape. Do not "invent" views or extra windows.
-      - PERSPECTIVE: Do not shift the camera. The output must overlay perfectly on top of the sketch.
-      
-      PHOTOREALISM MANDATE (ULTRA-HIGH FIDELITY):
-      - RENDER HIGH-QUALITY, REALISTIC MATERIALS: Use physically based rendering (PBR) mandates. Concrete must show micro-texture and subtle imperfections. Glass must feature Fresnel-accurate reflections and high-quality transparency. Metal must exhibit realistic specular highlights and anisotropic brushing where applicable.
-      - ATMOSPHERIC RENDERING: Implement ray-traced global illumination, complex soft shadows, and accurate ambient occlusion.
-      - PHOTOGRAPHIC QUALITY: The output must look like it was shot on a Phase One medium format camera. 8k resolution textures. Perfect lens geometry.
-      
-      STYLE: ${params.style}.
-      ${contextPrompt}
-      
-      MATERIAL LOGIC:
-      ${materialInstruction}
-      
-      FINAL QUALITY REQUIREMENTS:
-      Ensure Ultra HD clarity. The landscape must be photographic quality, with realistic vegetation and sky integration. ${isInterior ? 'Prioritize realistic bounce lighting, texture depth, and realistic fabric folds.' : 'Prioritize accurate solar shadows and atmospheric haze.'}`;
+      // Add Text Prompt at the end
+      const finalPrompt = `
+        ROLE: High-End Architectural Visualizer.
+        TASK: Transform the input sketch (Image #0) into a photorealistic ${params.style} render.
+        CAMERA ANGLE: ${params.angle}
+        
+        ${materialInstruction}
+        
+        ${contextPrompt}
+        
+        OUTPUT QUALITY: 8k resolution, unbiased rendering, ray-traced lighting, photorealistic.
+      `;
 
-      parts.push({ text: prompt });
-
-      // Handle texture sample if in text-prompt mode (Legacy support for single sample upload)
-      if (params.materialMode === 'text-prompt' && params.materialTextureImage) {
-        const textureImg = await this.processImageInput(params.materialTextureImage);
-        parts.push({
-          inlineData: {
-            mimeType: textureImg.mimeType,
-            data: textureImg.data
-          }
-        });
-        parts.push({ text: `SURFACE FINISH REFERENCE: Apply the physical properties of this sample to relevant elements.` });
-      }
-
-      const ai = new GoogleGenAI({ apiKey: "AIzaSyBQGJDAFp7dXxgpv7Ww_OV53Ck_lU9M4VQ" });
-      
-      // Determine final aspect ratio
-      // Ensure strict typing for Gemini API which does not support 'Auto'
-      let finalAspectRatio = (params.aspectRatio === 'Auto' ? '1:1' : params.aspectRatio) as "1:1" | "16:9" | "9:16" | "3:4" | "4:3";
-      
-      // Auto-detect ratio from sketch if set to Auto
-      if (params.aspectRatio === 'Auto') {
-         try {
-             const dims = await this.getImageDimensions(sketchImg.data, sketchImg.mimeType);
-             finalAspectRatio = this.getClosestAspectRatio(dims.width, dims.height) as "1:1" | "16:9" | "9:16" | "3:4" | "4:3";
-         } catch (e) {
-             console.warn("Could not detect aspect ratio, defaulting to 1:1");
-         }
-      }
+      parts.push({ text: finalPrompt });
 
       const response = await ai.models.generateContent({
-        model: 'gemini-3-pro-image-preview',
+        model: 'gemini-2.5-flash-image', // Fast, high quality generation
         contents: { parts },
         config: {
-          imageConfig: {
-            aspectRatio: finalAspectRatio,
-            imageSize: "2K"
-          }
-        }
-      });
-
-      const candidates = response.candidates;
-      if (!candidates || candidates.length === 0) throw new Error("No response candidates from AI.");
-      
-      for (const part of candidates[0].content.parts) {
-        if (part.inlineData) {
-          return `data:image/png;base64,${part.inlineData.data}`;
-        }
-      }
-      throw new Error("No image data returned in the response.");
-    });
-  }
-
-  async editImage(baseImage: string, instruction: string): Promise<string> {
-    return this.withRetry(async () => {
-      const img = await this.processImageInput(baseImage);
-      
-      // Auto-detect aspect ratio for editing to prevent distortion
-      let aspectRatio = "1:1" as "1:1" | "16:9" | "9:16" | "3:4" | "4:3";
-      try {
-          const dims = await this.getImageDimensions(img.data, img.mimeType);
-          aspectRatio = this.getClosestAspectRatio(dims.width, dims.height) as "1:1" | "16:9" | "9:16" | "3:4" | "4:3";
-      } catch (e) {
-          console.warn("Could not detect edit aspect ratio");
-      }
-
-      const ai = new GoogleGenAI({ apiKey: "AIzaSyBQGJDAFp7dXxgpv7Ww_OV53Ck_lU9M4VQ" });
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image',
-        contents: {
-          parts: [
-            {
-              inlineData: {
-                data: img.data,
-                mimeType: img.mimeType
-              }
-            },
-            { 
-              text: `OBJECTIVE: ARCHITECTURAL EDITING / IMAGE MODIFICATION.
-              
-              INSTRUCTION: ${instruction}
-              
-              RULES:
-              1. Apply the instruction to the provided image.
-              2. Maintain the perspective, lighting, and style of the original image unless instructed otherwise.
-              3. If specific regions are described, modify only those regions. If global changes are requested, apply them generally.
-              4. High fidelity output.` 
-            }
-          ]
-        },
-        config: {
             imageConfig: {
-                aspectRatio: aspectRatio
+                aspectRatio: params.aspectRatio === 'Auto' ? undefined : params.aspectRatio
             }
         }
       });
-      const candidates = response.candidates;
-      if (!candidates || candidates.length === 0) throw new Error("No edit candidates.");
-      for (const part of candidates[0].content.parts) {
+
+      // Handle response parts to find image
+      for (const part of response.candidates?.[0]?.content?.parts || []) {
         if (part.inlineData) {
-          return `data:image/png;base64,${part.inlineData.data}`;
+            return part.inlineData.data;
         }
       }
-      throw new Error("No image data returned from edit model");
+      throw new Error("No image generated in response");
     });
   }
 
-  // Restored: Use mask for precise modification
+  async editImage(baseImage: string, prompt: string): Promise<string> {
+    return this.withRetry(async () => {
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+        const img = await this.processImageInput(baseImage);
+        
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash-image',
+            contents: {
+                parts: [
+                    { inlineData: { mimeType: img.mimeType, data: img.data } },
+                    { text: `Edit this image: ${prompt}. Maintain the original perspective and lighting.` }
+                ]
+            }
+        });
+
+        for (const part of response.candidates?.[0]?.content?.parts || []) {
+            if (part.inlineData) {
+                return part.inlineData.data;
+            }
+        }
+        throw new Error("No image generated from edit");
+    });
+  }
+
   async modifyWithMask(baseImage: string, maskImage: string, prompt: string): Promise<string> {
     return this.withRetry(async () => {
-      const baseImg = await this.processImageInput(baseImage);
-      const maskImg = await this.processImageInput(maskImage);
+        // Since the current SDK might not strictly support "mask" inputs directly in `generateContent` for editing in the same way regular inpainting works,
+        // we prompt the model to use the mask as a guide or use the Image Editing capabilities if supported.
+        // For 'gemini-2.5-flash-image', we provide both images and a strong instruction.
+        
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+        const base = await this.processImageInput(baseImage);
+        const mask = await this.processImageInput(maskImage);
 
-      // Auto-detect aspect ratio for modification to prevent distortion
-      let aspectRatio = "1:1" as "1:1" | "16:9" | "9:16" | "3:4" | "4:3";
-      try {
-          const dims = await this.getImageDimensions(baseImg.data, baseImg.mimeType);
-          aspectRatio = this.getClosestAspectRatio(dims.width, dims.height) as "1:1" | "16:9" | "9:16" | "3:4" | "4:3";
-      } catch (e) {
-          console.warn("Could not detect modify aspect ratio");
-      }
-
-      const ai = new GoogleGenAI({ apiKey: "AIzaSyBQGJDAFp7dXxgpv7Ww_OV53Ck_lU9M4VQ" });
-      
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image',
-        contents: {
-          parts: [
-            // Original Image (Image #0)
-            {
-              inlineData: {
-                data: baseImg.data,
-                mimeType: baseImg.mimeType
-              }
-            },
-            // The Mask (Image #1) - Black Background, White Stroke/Rect
-            {
-              inlineData: {
-                data: maskImg.data,
-                mimeType: maskImg.mimeType
-              }
-            },
-            // Prompt
-            { 
-              text: `TASK: GENERATIVE INPAINTING / MODIFICATION.
-              
-              INPUTS:
-              - Image #0: Base image.
-              - Image #1: Mask (White Area = Target Region for Edit, Black Area = Frozen/Protected).
-              
-              INSTRUCTION:
-              Modify ONLY the area defined by the WHITE parts of Mask #1 to match this request: "${prompt}".
-              
-              STRICT RULES:
-              1. MODIFICATION: Change the pixels inside the masked area (Image #1 White) to implement: "${prompt}".
-              2. INTEGRATION: The new content must seamlessly blend with the surrounding environment in Image #0 (lighting, perspective, shadows, grain).
-              3. FROZEN BACKGROUND: Do NOT change any pixel corresponding to the BLACK area of the mask.
-              4. OUTPUT: Return the full image with the modification applied.` 
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash-image',
+            contents: {
+                parts: [
+                    { inlineData: { mimeType: base.mimeType, data: base.data } },
+                    { inlineData: { mimeType: mask.mimeType, data: mask.data } },
+                    { text: `INSTRUCTION: Perform a masked edit. Image #0 is the Source. Image #1 is the Mask (White area is the edit zone). 
+                    Task: ${prompt}. 
+                    Apply changes ONLY to the white area of the mask. Keep the black area of the mask exactly identical to the source image.` }
+                ]
             }
-          ]
-        },
-        config: {
-            imageConfig: {
-                aspectRatio: aspectRatio
+        });
+
+        for (const part of response.candidates?.[0]?.content?.parts || []) {
+            if (part.inlineData) {
+                return part.inlineData.data;
             }
         }
-      });
-
-      const candidates = response.candidates;
-      if (!candidates || candidates.length === 0) throw new Error("No modification candidates.");
-      for (const part of candidates[0].content.parts) {
-        if (part.inlineData) {
-          return `data:image/png;base64,${part.inlineData.data}`;
-        }
-      }
-      throw new Error("No image data returned from modification.");
+        throw new Error("No image generated from masked edit");
     });
   }
 
-  async upscaleImage(baseImage: string): Promise<string> {
+  async upscaleImage(sourceImage: string): Promise<string> {
     return this.withRetry(async () => {
-      const img = await this.processImageInput(baseImage);
-      
-      if (img.data.length < 200) {
-          throw new Error("Failed to process image data. Source invalid.");
-      }
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-      const response = await ai.models.generateContent({
-        model: 'gemini-3-pro-image-preview',
-        contents: {
-          parts: [
-            {
-              inlineData: {
-                data: img.data,
-                mimeType: img.mimeType
-              }
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+        const img = await this.processImageInput(sourceImage);
+
+        // Use Pro model for 4K upscaling tasks
+        const response = await ai.models.generateContent({
+            model: 'gemini-3-pro-image-preview', 
+            contents: {
+                parts: [
+                    { inlineData: { mimeType: img.mimeType, data: img.data } },
+                    { text: "Upscale this image to 4K resolution. Enhance details, textures, and lighting while strictly preserving the original composition and geometry. Do not hallucinate new objects." }
+                ]
             },
-            { 
-              text: `TASK: Upscale this architectural render to 4K resolution.
-              INSTRUCTIONS:
-              1. RESAMPLE: Significantly increase image resolution and clarity to 4K.
-              2. ENHANCE DETAILS: Refine textures. Sharpen architectural edges.
-              3. DENOISE: Remove artifacts.
-              4. PRESERVE INTEGRITY: Maintain exact geometry and lighting.
-              5. OUTPUT: High-fidelity, print-ready architectural visualization.` 
+            config: {
+                imageConfig: {
+                    imageSize: "4K"
+                }
             }
-          ]
-        },
-        config: {
-          imageConfig: {
-            aspectRatio: "16:9",
-            imageSize: "4K"
-          }
+        });
+
+        for (const part of response.candidates?.[0]?.content?.parts || []) {
+            if (part.inlineData) {
+                return part.inlineData.data;
+            }
         }
-      });
-      const candidates = response.candidates;
-      if (!candidates || candidates.length === 0) throw new Error("No upscale candidates.");
-      for (const part of candidates[0].content.parts) {
-        if (part.inlineData) {
-          return `data:image/png;base64,${part.inlineData.data}`;
-        }
-      }
-      throw new Error("No image data returned from upscale model");
+        throw new Error("No image generated from upscale");
     });
   }
 }
