@@ -1,370 +1,174 @@
-
 import { GoogleGenAI } from "@google/genai";
 import { RenderParams } from "../types";
 
 export class GeminiService {
+  private apiKey?: string;
+
+  constructor(apiKey?: string) {
+    this.apiKey = apiKey;
+  }
+
+  // Helper to safely get the key in Vite
+  private getApiKey(): string {
+    // Priority: 1. Constructor key, 2. Vite Env Var
+    const key = this.apiKey || import.meta.env.VITE_GEMINI_API_KEY;
+    if (!key) throw new Error("API Key not found. Check VITE_GEMINI_API_KEY in Google Cloud variables.");
+    return key;
+  }
+
   private async withRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
     let lastError: any;
     for (let i = 0; i < maxRetries; i++) {
       try {
         return await fn();
       } catch (error: any) {
-        // 1. Robust Error Message Extraction
-        let errorMessage = "Unknown Error";
+        lastError = error;
+        const lowerMessage = (error?.message || '').toLowerCase();
         
-        if (typeof error === 'string') {
-            errorMessage = error;
-        } else if (error instanceof Error) {
-            errorMessage = error.message;
-        } else if (error && typeof error === 'object') {
-            // Handle API JSON error responses like {"error": {"message": "..."}}
-            if (error.error && error.error.message) {
-                errorMessage = error.error.message;
-            } else if (error.message) {
-                errorMessage = String(error.message);
-            } else {
-                try {
-                    // Be careful with stringify here too
-                    errorMessage = JSON.stringify(error);
-                } catch (e) {
-                    errorMessage = "Circular/Complex Error Object";
-                }
-            }
+        console.error(`Attempt ${i + 1} failed:`, lowerMessage);
+
+        if (lowerMessage.includes('requested entity was not found') || lowerMessage.includes('api_key')) {
+          const keyErr = new Error("API_KEY_ERROR: The API Key is invalid or the Model Name doesn't exist.");
+          keyErr.stack = error.stack;
+          throw keyErr;
         }
 
-        // 2. Create clean Error object (prevents circular reference issues in calling code)
-        lastError = new Error(errorMessage);
-        if (error instanceof Error && error.stack) {
-            lastError.stack = error.stack;
-        }
-
-        const lowerMessage = errorMessage.toLowerCase();
-
-        // 3. Check for specific Critical Errors (No Retry)
-        if (lowerMessage.includes('requested entity was not found') || lowerMessage.includes('api_key_required')) {
-          throw new Error("API_KEY_REQUIRED");
-        }
-        if (lowerMessage.includes('leaked') || lowerMessage.includes('permission_denied')) {
-          throw new Error("API_KEY_LEAKED");
-        }
-
-        // 4. Check for Transient Errors (Retry)
         const isTransient = 
-          lowerMessage.includes('500') || 
-          lowerMessage.includes('internal error') ||
-          lowerMessage.includes('503') || 
+          lowerMessage.includes('503') ||
           lowerMessage.includes('overloaded') || 
           lowerMessage.includes('429') || 
           lowerMessage.includes('rate limit') || 
-          lowerMessage.includes('unavailable') || 
-          lowerMessage.includes('fetch') || 
-          lowerMessage.includes('network') ||
-          lowerMessage.includes('failed to load');
+          lowerMessage.includes('unavailable');
         
         if (isTransient && i < maxRetries - 1) {
           const delay = Math.pow(2, i + 1) * 1000 + Math.random() * 1000;
-          console.warn(`API Busy or Network Error (${errorMessage}). Retrying in ${Math.round(delay)}ms...`);
+          console.warn(`API Busy. Retrying in ${Math.round(delay)}ms...`);
           await new Promise(resolve => setTimeout(resolve, delay));
           continue;
         }
-        
-        throw lastError;
+        throw error;
       }
     }
     throw lastError;
   }
 
-  private async processImageInput(input: string): Promise<{ data: string, mimeType: string }> {
-    const str = String(input).trim();
-    
-    // 1. Handle URL (http/https)
-    if (/^https?:\/\//i.test(str)) {
-      try {
-        const response = await fetch(str, { 
-            method: 'GET', 
-            mode: 'cors',
-            cache: 'no-store', 
-            credentials: 'omit'
-        });
-        if (!response.ok) throw new Error(`Fetch status: ${response.status}`);
-        const blob = await response.blob();
-        
-        // Use detected mime type if valid
-        const mimeType = blob.type;
-        const validTypes = ['image/png', 'image/jpeg', 'image/webp', 'image/heic', 'image/heif'];
-        
-        if (validTypes.includes(mimeType)) {
-             return await new Promise((resolve, reject) => {
-                const reader = new FileReader();
-                reader.onloadend = () => {
-                    const res = reader.result as string;
-                    // Remove data url prefix
-                    const data = res.includes(',') ? res.split(',')[1] : res;
-                    resolve({ data, mimeType });
-                };
-                reader.onerror = () => reject(new Error("FileReader failed"));
-                reader.readAsDataURL(blob);
-             });
-        } else {
-             throw new Error("Invalid mime type, forcing conversion");
-        }
-      } catch (e) {
-         // Fallback: Load via Image and draw to Canvas (converts to PNG)
-         return await new Promise((resolve, reject) => {
-            const img = new Image();
-            img.crossOrigin = 'anonymous';
-            img.onload = () => {
-                const canvas = document.createElement('canvas');
-                canvas.width = img.width;
-                canvas.height = img.height;
-                const ctx = canvas.getContext('2d');
-                if(!ctx) { reject(new Error("Canvas context failed")); return; }
-                ctx.drawImage(img, 0, 0);
-                const dataUrl = canvas.toDataURL('image/png');
-                resolve({ 
-                    data: dataUrl.split(',')[1], 
-                    mimeType: 'image/png' 
-                });
-            };
-            // CRITICAL FIX: Do not pass the event object 'e' to reject, as it contains circular refs
-            img.onerror = () => reject(new Error("Image load failed during fallback conversion"));
-            
-            try {
-                const urlObj = new URL(str);
-                urlObj.searchParams.set('cb', Date.now().toString());
-                img.src = urlObj.toString();
-            } catch {
-                img.src = str;
-            }
-         });
-      }
-    }
-
-    // 2. Handle Data URL (data:image/xyz;base64,...)
-    if (str.startsWith('data:')) {
-        const mimeType = str.substring(5, str.indexOf(';'));
-        const data = str.split(',')[1];
-        return { data, mimeType };
-    }
-
-    // 3. Raw Base64 (Assume PNG)
-    return { data: str, mimeType: 'image/png' };
-  }
-
   async generateRender(params: RenderParams, specificSketch: string): Promise<string> {
     return this.withRetry(async () => {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-      
-      const sketchImg = await this.processImageInput(specificSketch);
       const parts: any[] = [
         {
           inlineData: {
-            mimeType: sketchImg.mimeType,
-            data: sketchImg.data
+            mimeType: 'image/png',
+            data: specificSketch.includes('base64,') ? specificSketch.split('base64,')[1] : specificSketch
           }
         }
       ];
 
-      // Step 2: Texture & Finish - Handle Modes
-      let materialInstruction = "";
+      let materialInstruction = '';
       
-      if (params.materialMode === 'color-map' && params.mode === 'Exterior') {
-        const mappingsText = params.materialMappings
-            .filter(m => m.color && m.material)
-            .map(m => `- Color "${m.color}" matches Material "${m.material}"`)
-            .join('\n');
+      if (params.materialMode === 'color-key') {
+        const mappingsWithTextures = params.materialMappings.filter(m => m.color && m.material);
+        let mappingText = "STRICT COLOR-TO-MATERIAL BOUNDARY ENFORCEMENT:\nThe sketch is a geometric blueprint where each color defines a specific material zone. DO NOT bleed materials across these color lines.\n";
         
-        materialInstruction = `STRICT COLOR-MATERIAL MAPPING:\n${mappingsText}\nINSTRUCTION: The input sketch (Image #0) is color-coded. Identify areas matching the specified colors and apply the corresponding high-fidelity materials. Do not change the geometry. For areas not specified, use context-appropriate materials.`;
-
-        // Handle physical texture uploads for mappings
-        for (const mapping of params.materialMappings) {
-            if (mapping.textureImage) {
-                const texture = await this.processImageInput(mapping.textureImage);
-                parts.push({
-                    inlineData: { mimeType: texture.mimeType, data: texture.data }
-                });
-                materialInstruction += `\n- Use Image #${parts.length - 1} as the physical texture reference for "${mapping.material}".`;
-            }
-        }
-
-      } else if (params.mode === 'Interior' && params.materialMode === 'reference-image' && params.materialTextureImage) {
-         // INTERIOR REFERENCE IMAGE MODE
-         const refImg = await this.processImageInput(params.materialTextureImage);
-         parts.push({
-            inlineData: { mimeType: refImg.mimeType, data: refImg.data }
-         });
-         materialInstruction = `STYLE & MATERIAL REFERENCE: Use Image #${parts.length - 1} as the PRIMARY reference for materials, lighting, and overall aesthetic. The materials in the generated render must match the textures and finishes visible in this reference image.`;
-         
-         if (params.materialPrompt && params.materialPrompt.trim().length > 0) {
-             materialInstruction += `\nADDITIONAL NOTES: ${params.materialPrompt}`;
-         }
-
-      } else {
-        // DEFAULT TEXT PROMPT MODE
-        materialInstruction = `GLOBAL MATERIAL SPECIFICATIONS & FINISHES:\n${params.materialPrompt}\nIMPORTANT: Apply high-fidelity, PBR-accurate textures based on this description. Concrete should look porous, wood should have grain, glass should have accurate reflections.`;
-      }
-
-      const isInterior = params.mode === 'Interior';
-      let contextPrompt = isInterior ? 
-        `INTERIOR AMBIANCE: ${params.interiorAmbiance}` : 
-        `ENVIRONMENT & LANDSCAPE: ${params.landscapePrompt}`;
-
-      // Step 3: Furniture & Staging Logic
-      if (isInterior && params.furnitureInspirationImage) {
-        const furnitureImg = await this.processImageInput(params.furnitureInspirationImage);
-        const furniturePartIndex = parts.length;
-        parts.push({
-          inlineData: {
-            mimeType: furnitureImg.mimeType,
-            data: furnitureImg.data
+        mappingsWithTextures.forEach((m) => {
+          if (m.textureImage) {
+            const partIndex = parts.length;
+            parts.push({
+              inlineData: {
+                mimeType: 'image/png',
+                data: m.textureImage.split('base64,')[1]
+              }
+            });
+            mappingText += `- AREAS COLORED ${m.color.toUpperCase()}: Apply ${m.material}. Use image part #${partIndex} for the exact texture detail.\n`;
+          } else {
+            mappingText += `- AREAS COLORED ${m.color.toUpperCase()}: Apply high-quality ${m.material} texture.\n`;
           }
         });
-
-        if (params.furnitureLayoutMode === 'empty') {
-            contextPrompt += `\n
-            TASK: VIRTUAL STAGING OF AN EMPTY SPACE.
-            1. GEOMETRY PRESERVATION: The input sketch (Image #0) is the architectural shell. DO NOT MODIFY WALLS, WINDOWS, or CEILINGS.
-            2. FURNISHING: Furnish the space based on: "${params.furniturePrompt}".
-            3. STYLE MATCHING: Use Image #${furniturePartIndex} as the stylistic reference.
-            `;
-        } else {
-            contextPrompt += `\n
-            TASK: FURNITURE REPLACEMENT.
-            1. SPATIAL INTEGRITY: Preserve room boundaries from Image #0.
-            2. STYLE MATCHING: The new furniture MUST match the style of Image #${furniturePartIndex}.
-            `;
-        }
-      } else if (isInterior) {
-        contextPrompt += `\nTASK: INTERIOR REALIZATION. The input sketch is the ground truth. Preserve all geometry.`;
+        materialInstruction = mappingText;
+      } else {
+        materialInstruction = `GLOBAL MATERIAL SPECIFICATIONS:\n${params.materialPrompt}`;
       }
 
-      if (!isInterior && params.sitePicture) {
-          const siteImg = await this.processImageInput(params.sitePicture);
-          const sitePartIndex = parts.length;
-          parts.push({
-            inlineData: { mimeType: siteImg.mimeType, data: siteImg.data }
-          });
-          contextPrompt += `\nSITE CONTEXT: Use Image #${sitePartIndex} as the strict background and environmental context. The building must be composited realistically into this specific site.`;
+      const prompt = `ACT AS A SENIOR ARCHITECTURAL VISUALIZER.
+      TASK: Photorealistically render the provided structural sketch.
+      STYLE: ${params.style}.
+      CONTEXT: ${params.description}.
+      ENVIRONMENT: ${params.landscapePrompt}
+      MATERIAL LOGIC: ${materialInstruction}
+      OUTPUT: High-end architectural photography. Use 4K-ready texture maps.`;
+
+      parts.push({ text: prompt });
+
+      if (params.materialMode === 'text-prompt' && params.materialTextureImage) {
+        parts.push({
+          inlineData: {
+            mimeType: 'image/png',
+            data: params.materialTextureImage.includes('base64,') ? params.materialTextureImage.split('base64,')[1] : params.materialTextureImage
+          }
+        });
+        parts.push({ text: "TEXTURE REFERENCE: Apply the qualities of this material sample to the building facades." });
       }
 
-      // Add Text Prompt at the end
-      const finalPrompt = `
-        ROLE: High-End Architectural Visualizer.
-        TASK: Transform the input sketch (Image #0) into a photorealistic ${params.style} render.
-        CAMERA ANGLE: ${params.angle}
-        
-        ${materialInstruction}
-        
-        ${contextPrompt}
-        
-        OUTPUT QUALITY: 8k resolution, unbiased rendering, ray-traced lighting, photorealistic.
-      `;
+      if (params.inspirationImage) {
+        parts.push({
+          inlineData: {
+            mimeType: 'image/png',
+            data: params.inspirationImage.includes('base64,') ? params.inspirationImage.split('base64,')[1] : params.inspirationImage
+          }
+        });
+        parts.push({ text: "MOOD REFERENCE: Extract lighting, atmosphere, and landscape style from this image, but DO NOT modify the building's shape." });
+      }
 
-      parts.push({ text: finalPrompt });
-
+      // FIX: Use the safe getApiKey method
+      const ai = new GoogleGenAI({ apiKey: this.getApiKey() });
+      
+      // FIX: Use a valid model name (gemini-1.5-flash)
       const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image', // Fast, high quality generation
-        contents: { parts },
-        config: {
-            imageConfig: {
-                aspectRatio: params.aspectRatio === 'Auto' ? undefined : params.aspectRatio
-            }
+        model: 'gemini-1.5-flash', 
+        contents: { parts }
+      });
+
+      const candidates = response.candidates;
+      if (!candidates || candidates.length === 0) throw new Error("No response candidates from AI.");
+      
+      for (const part of candidates[0].content.parts) {
+        if (part.inlineData) {
+          return `data:image/png;base64,${part.inlineData.data}`;
+        }
+      }
+      throw new Error("No image data returned in the response.");
+    });
+  }
+
+  async editImage(baseImage: string, instruction: string): Promise<string> {
+    return this.withRetry(async () => {
+      // FIX: Use the safe getApiKey method
+      const ai = new GoogleGenAI({ apiKey: this.getApiKey() });
+      
+      // FIX: Use a valid model name
+      const response = await ai.models.generateContent({
+        model: 'gemini-1.5-flash',
+        contents: {
+          parts: [
+            {
+              inlineData: {
+                data: baseImage.includes('base64,') ? baseImage.split('base64,')[1] : baseImage,
+                mimeType: 'image/png'
+              }
+            },
+            { text: `INSTRUCTION: ${instruction}. Maintain the existing lighting, perspective, and resolution.` }
+          ]
         }
       });
 
-      // Handle response parts to find image
-      for (const part of response.candidates?.[0]?.content?.parts || []) {
+      const candidates = response.candidates;
+      if (!candidates || candidates.length === 0) throw new Error("No edit candidates.");
+      
+      for (const part of candidates[0].content.parts) {
         if (part.inlineData) {
-            return part.inlineData.data;
+          return `data:image/png;base64,${part.inlineData.data}`;
         }
       }
-      throw new Error("No image generated in response");
-    });
-  }
-
-  async editImage(baseImage: string, prompt: string): Promise<string> {
-    return this.withRetry(async () => {
-        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-        const img = await this.processImageInput(baseImage);
-        
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash-image',
-            contents: {
-                parts: [
-                    { inlineData: { mimeType: img.mimeType, data: img.data } },
-                    { text: `Edit this image: ${prompt}. Maintain the original perspective and lighting.` }
-                ]
-            }
-        });
-
-        for (const part of response.candidates?.[0]?.content?.parts || []) {
-            if (part.inlineData) {
-                return part.inlineData.data;
-            }
-        }
-        throw new Error("No image generated from edit");
-    });
-  }
-
-  async modifyWithMask(baseImage: string, maskImage: string, prompt: string): Promise<string> {
-    return this.withRetry(async () => {
-        // Since the current SDK might not strictly support "mask" inputs directly in `generateContent` for editing in the same way regular inpainting works,
-        // we prompt the model to use the mask as a guide or use the Image Editing capabilities if supported.
-        // For 'gemini-2.5-flash-image', we provide both images and a strong instruction.
-        
-        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-        const base = await this.processImageInput(baseImage);
-        const mask = await this.processImageInput(maskImage);
-
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash-image',
-            contents: {
-                parts: [
-                    { inlineData: { mimeType: base.mimeType, data: base.data } },
-                    { inlineData: { mimeType: mask.mimeType, data: mask.data } },
-                    { text: `INSTRUCTION: Perform a masked edit. Image #0 is the Source. Image #1 is the Mask (White area is the edit zone). 
-                    Task: ${prompt}. 
-                    Apply changes ONLY to the white area of the mask. Keep the black area of the mask exactly identical to the source image.` }
-                ]
-            }
-        });
-
-        for (const part of response.candidates?.[0]?.content?.parts || []) {
-            if (part.inlineData) {
-                return part.inlineData.data;
-            }
-        }
-        throw new Error("No image generated from masked edit");
-    });
-  }
-
-  async upscaleImage(sourceImage: string): Promise<string> {
-    return this.withRetry(async () => {
-        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-        const img = await this.processImageInput(sourceImage);
-
-        // Use Pro model for 4K upscaling tasks
-        const response = await ai.models.generateContent({
-            model: 'gemini-3-pro-image-preview', 
-            contents: {
-                parts: [
-                    { inlineData: { mimeType: img.mimeType, data: img.data } },
-                    { text: "Upscale this image to 4K resolution. Enhance details, textures, and lighting while strictly preserving the original composition and geometry. Do not hallucinate new objects." }
-                ]
-            },
-            config: {
-                imageConfig: {
-                    imageSize: "4K"
-                }
-            }
-        });
-
-        for (const part of response.candidates?.[0]?.content?.parts || []) {
-            if (part.inlineData) {
-                return part.inlineData.data;
-            }
-        }
-        throw new Error("No image generated from upscale");
+      throw new Error("No image data returned from edit model");
     });
   }
 }
